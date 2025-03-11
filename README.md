@@ -1,5 +1,5 @@
 ## Data and code from: Chemical signatures in the preen oil of Pied Flycatchers: testing reproducibility and exploring ontogeny
-##### Laurence Jeanjean, Barbara A. Caspers1, Tim Schmoll & Marc Gilles
+##### Laurence Jeanjean, Barbara A. Caspers, Tim Schmoll & Marc Gilles
 
 **Related article:** Jeanjean, L., Caspers, B. A., Schmoll, T., & Gilles, M. (2024).
 Chemical signatures in the preen oil of Pied Flycatchers: testing reproducibility and exploring ontogeny.
