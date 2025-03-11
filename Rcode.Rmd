@@ -1,0 +1,2313 @@
+---
+title: "R Code for Chemical signatures in the preen oil of Pied Flycatchers: testing reproducibility and exploring ontogeny"
+author: "Laurence Jeanjean, Barbara A. Caspers, Tim Schmoll & Marc Gilles"
+date: "`10.2024`"
+output:
+  pdf_document: 
+    toc: yes 
+    toc_depth: 3
+    number_sections: yes 
+    highlight: tango 
+  html_document:
+    theme: readable 
+    toc: yes 
+    number_sections: yes
+    toc_float: yes
+    highlight: tango 
+header-includes:
+  - \renewcommand{\contentsname}{Contents}
+encoding: UTF-8
+---
+
+* Context
+
+The present document is an appendix of a paper on the preen oil composition in pied flycatchers (reproducibility and ontogeny). It contains the script for all R-based analyses from this paper. 
+In the first part of this document, we prepare the chemical and meta data for analysis. In a second part, we present the code and results of our pre-registered analysis, replication of an original study by Gilles et al. (2024). In a last part you will find the code and results for our exploratory analyses on the same data-set.
+
+* Pre-registered analysis: https://osf.io/tbcug
+* Original paper: Gilles M, Fokkema RW, Krosten P, Caspers BA, Schmoll T. Preen oil composition of Pied Flycatchers is similar between partners but differs between sexes and breeding stages. Ibis. 2024.
+
+# Data
+## Import library and data
+Required library
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse) # For data transformation and plots
+library(readxl) # To upload excel files
+library(lme4) # To fit the mixed model
+library(lmerTest) # To obtain P-values of the mixed models
+library(broom.mixed) # To obtain $\beta$ estimates and their confidence intervals of the fixed effects
+library(partR2) # To obtain marginal R2
+library(rptR) # To obtain repeatability of random effects
+library(performance) # For model diagnostics
+#library(qqplotr)  # For the performance package to fully function
+library(see) # For the performance package to fully function
+library(patchwork)  # For the performance package to fully function
+library(effsize)  # For effect sizes
+library(vegan) # For Bray Curtis matrices in the spatial analysis
+library(glmmTMB)  # For Pairwise distance analyses
+library(GCalignR) # For the chemical alignment
+```
+
+Import data
+```{r, warning=FALSE, message=FALSE}
+setwd("~/your_own_file")
+Metadata <- read_excel("metadata.xlsx")
+ChemdataRaw <- read.csv("chemdata.csv", header = F, check.names = F)
+MetadataP1 <- read_excel("metadata_orig.xlsx")
+eff_sizes <- read_excel("effect_sizes.xlsx")
+GPSNetboxes <- read.csv("gpsdata.csv")
+``` 
+
+## Pre-selection of samples for analysis
+
+We discard N=23 samples for which the chromatogram seemed to carry too much noise or no preen oil substances, N=2 samples for which information on breeding stage was missing, and N=6 samples from individuals that were sampled twice during nestling-rearing (in that case we kept the second sample, the first one being too close to the hatching date). We are left with a total of 218 samples.
+
+```{r}
+Metadata <- Metadata %>%
+  filter(GCsuccess == 1,  # Remove samples with too much noise or no preen oil
+         Breeding_Stage != "NA", # Remove samples with no information on breeding stage
+         CapturedTwiceNR == 0) %>% # Remove samples from individuals sampled twice during nestling-rearing
+  select(-c(GCsuccess, CapturedTwiceNR, captureevent, wing, mass, drost, GCbatch)) # Remove variables that will not be used after
+```
+
+## Preparation of the Chemical data
+### Alignment of the chemical data with GCalignR
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+#Creating a file in the right format for GCalignR
+aligndata <- ChemdataRaw[,!(ChemdataRaw[3,]=="failed chromatogram")] # Removing failed samples 
+aligndata <- aligndata[,!(aligndata[3,]=="no chromatogram")]
+aligndata <- aligndata[,c(T,T,F,F)] # Removing 3rd and 4th colomn 
+sampleids <- aligndata[1,] # create a dataframe with just the first row
+sampleids <- sampleids[,c(T,F)] # remove empty cell between each sampleID
+RTarea <- matrix(c("RT","area")) # prepare the row with RT/area
+RTarea <- t(RTarea) # flip columns and rows
+RTarea <- data.frame(RTarea) 
+aligndata <- qpcR:::rbind.na(sampleids, RTarea, aligndata) # bind sampleIDs, RTarea and the data, fill the end of sampleIDs and RT/area with NAs
+ChemdataRaw <- aligndata[-c(3,4),] # remove unnecessary rows
+write.table(ChemdataRaw,"Alignment.txt",
+            row.names = F, col.names = F, sep="\t", na = "", quote = F) # save as a .txt file
+check_input("Alignment.txt") # check that the data format is good
+
+#Choosing a reference sample
+choose_optimal_reference(data = "Alignment.txt", rt_col_name = "RT")
+
+#Grouping blanks and field controls in a separate file 
+blanks <- c("blank1108_1", "blank1108_2", "blank1208_1", "blank1208_5", "blank1308_1", "blank1308_2", "blank1308_3", "blank1408_1", "blank1408_3", "blank1408_4", "blank1508_1","blank1508_2","blank1508_3","blank1508_4", "blank1608_1", "blank1608_2", "blank1608_3", "blank1608_4", "blank1708_1", "blank1708_2", "blank1708_3", "blank1708_4","blank1808_1", "blank1808_2","blank1808_3", "blank2609", "blank2909_1", "blank2909_2","blank2909_3", "blank3009_1", "blank3009_2", "blank3009_3","blank2409_1",
+            "L21", "L31", "L49", "L62", "L44", "L70", "L82", "L91", "L97", "L133", "L166", "L199", "L236", "L247", "L284", "L5", "L117") 
+
+#Alignment
+alignedData <- align_chromatograms(
+  data = "Alignment.txt", # raw chromatographic data
+  rt_col_name = "RT",
+  reference = "L223", # obtained from the function 'choose_optimal_reference()'
+  blanks = blanks, # delete substances detected in control samples
+  delete_single_peak = TRUE,  # delete substances detected in one sample only
+  remove_empty = TRUE,  # remove empty samples
+  max_linear_shift = 0.03, # expected linear drift
+  max_diff_peak2mean = 0.015, # allowed RT difference of a peak with the mean of the corresponding row
+  min_diff_peak2peak = 0.035, # expected minimum RT difference among homologous substances
+  permute = F,  # keep the order of samples constant between different alignments
+  write_output = c("area"))
+
+print(alignedData) 
+save(alignedData, file = "alignedData.RData") 
+
+# Diagnistics plots
+gc_heatmap(alignedData,threshold = 0.02) 
+plot(alignedData,which_plot = "all")
+``` 
+If the chemical data has already been aligned once on the computer, the aligned data can directly be loaded (instead of running the alignment each time) 
+```{r, eval=FALSE, message=FALSE}
+load("~/your_own_file/alignedData.RData")
+```
+Manual method (load the data from the text file created by GC-alignR)
+```{r, echo=TRUE, eval=FALSE, warning=FALSE, message=FALSE}
+Chemdata <- read.table("Alignment_area.txt",header = F)
+samplenames <- Chemdata[1,]
+rownames(Chemdata) <- as.matrix(Chemdata[,1])
+Chemdata <- Chemdata[,-1]
+colnames(Chemdata) <- as.matrix(Chemdata[1,])
+Chemdata <- Chemdata[-1,]
+Chemdata <- as.data.frame(t(Chemdata))
+str(Chemdata)
+chemdata.num <- data.frame(lapply(Chemdata, function(x) as.numeric(as.character(x))))
+str(chemdata.num)
+chemdata.num$sample <- t(samplenames)[-1,]
+chemdata.num[names(chemdata.num)=='sample']
+chemdata.num <- chemdata.num[,c(which(colnames(chemdata.num)=="sample"),
+                                which(colnames(chemdata.num)!="sample"))]
+rownames(chemdata.num) <- as.matrix(chemdata.num[,1])
+chemdata.num <- chemdata.num[,-1]
+Chemdata <- chemdata.num
+noms_colonnes <- names(Chemdata)
+noms_colonnes_sans_X <- sub("^X", "", noms_colonnes)
+names(Chemdata) <- noms_colonnes_sans_X
+```
+After alignment, 8 samples appeared as clear outliers (4 samples from incubating females, 1 sample from an incubating male and 3 samples from nestlings). They are not included in the data subsets of the different analyses.
+
+
+### Transformation of the aligned data
+Standardize the aligned data
+```{r}
+Chemdata.norm <- norm_peaks(alignedData, conc_col_name = "area",rt_col_name = "RT",
+out = "data.frame")
+```
+Log-transforme the aligned data
+```{r}
+Chemdata <- log(Chemdata.norm + 1)
+``` 
+
+## Preparation of the Metadata
+### Calculating alpha diversity and Volatility measures
+
+Chemical richness: the number of substances in each sample
+```{r}
+Richness <- specnumber(Chemdata)
+``` 
+
+Shannon Diversity of each sample
+```{r}
+Shannon_Index <- diversity(Chemdata)
+```
+
+Volatility: i.e. the proportion of highly volatile compounds (total area under the chromatogram before peak C (retention time 10.12))
+```{r}
+# We get the volatility on the chemical data non log-transformed (Chemdata.norm)
+CumSum <- t(apply(Chemdata.norm, 1, cumsum))
+volatility <- CumSum[,"9.922", drop = F]
+colnames(volatility) <- "Volatility"
+volatility <- as.data.frame(volatility)
+```
+Example of the cumulative abundance curve of one sample for visualisation
+```{r}
+RT <- as.numeric(colnames(CumSum))
+prop <- CumSum["L61",] # sample L61
+data.plot <- data.frame(RT, prop)
+
+theme_set(theme_classic())
+ggplot(data.plot, aes(x=RT, y=prop))+
+  geom_line()+
+  geom_vline(xintercept=10, color="red")+
+  xlab("Retention Time (min)")+
+  ylab("Proportion of Abundance (%)") +
+  annotate("text", x=10.4, y=28, label= "C", color="red")+
+  annotate("text", x=5.5, y=50, label= "High Volatility")+
+  ggtitle("Proportion of abundance in relation with the retention time of one sample")
+```
+Add the alpha-diversity and volatility measures to the Metadata
+```{r}
+alpha_diversity <- data.frame(Richness = Richness, Shannon_Index = Shannon_Index)
+Metadata <- cbind(Metadata, alpha_diversity)
+Metadata <- cbind(Metadata, volatility)
+
+# Transform the alpha-diversity and volatility measures as numeric variables
+Metadata <- Metadata%>%
+  mutate(Richness = as.numeric(as.character(Richness)),
+         Shannon_Index = as.numeric(as.character(Shannon_Index)),
+         Volatility = as.numeric(as.character(Volatility)))
+```
+How many substances:
+```{r}
+ncol(Chemdata)
+mean(Metadata$Richness)
+sd(Metadata$Richness)
+```
+On the 218 samples retained for alignment, we find 88 substances.
+On average, each sample has 24 substances (sd = 7).
+```{r}
+# Create a Sample data set and a Sample variable in Chemdata
+Sample <- rownames(Chemdata)
+Chemdata <- rownames_to_column(Chemdata, var = "Sample")
+```
+
+## Control for Concentration bias
+Plot the Shannon diversity against "concentration", i.e. the total area under the chromatogram divided by the number of substances (the mean area under a substance in each sample)
+```{r, warning=FALSE, message=FALSE}
+# We need to calculate the area under the entire chromatogram, therefore we use
+#  the raw chemical data, before alignment.
+TotArea <- ChemdataRaw[,!(ChemdataRaw[3,]=="failed chromatogram")] 
+TotArea[1, seq(2, ncol(TotArea), by = 2)] <- TotArea[1, seq(1, ncol(TotArea), by = 2)] # So that the area values are also associated with the sample name
+TotArea <- TotArea[,c(F,T,F,F)] # select the areas
+TotArea <- TotArea[-2,]
+TotArea <- t(TotArea)
+TotArea <- as.data.frame(TotArea)
+SampleTotArea <- TotArea[,1]
+SampleTotArea <- as_tibble(SampleTotArea)
+SampleTotArea <- SampleTotArea %>% rownames_to_column()
+TotArea <- as_tibble(TotArea)
+TotArea <- TotArea%>% # Calculate the total area under each chromatogram
+  mutate_all(funs(as.integer(as.character(.))))%>%
+  rowwise() %>% 
+  mutate(AreaTot= sum(c_across(), na.rm = T))%>%  
+  dplyr::select("AreaTot", everything())
+TotArea <- TotArea%>%
+  select(AreaTot)%>%
+  rownames_to_column()
+df_list <- list(SampleTotArea, TotArea)
+TotArea <- df_list%>%
+  reduce(full_join, by="rowname")%>%
+  select(value, AreaTot)%>%
+  rename(Sample = value)
+df_list <- list(Metadata, TotArea)
+plot.Concentration <- df_list%>% # Combine with the metadata
+  reduce(full_join, by="Sample")%>%
+  filter(Individual_ID != "NA")%>% # select only the samples that  get used during analyses
+  mutate(Concentration = AreaTot/Richness) # calculate our proxy for the concentration of each sample
+```
+
+```{r}
+# plot
+ggplot(plot.Concentration, aes(x=Concentration, y=Shannon_Index))+
+  geom_point(shape=19)+
+  geom_smooth(color="black", se=F)+
+  ylab("Shannon diversity")+
+  xlab("Overall sample concentration")
+```
+Unlike the original study, although there is a positive relationship between "concentration" and Shannon diversity, there is no clear concentration threshold under which the Shannon diversity drops. Therefore, we will not discard additional samples from our data set. 
+
+
+# Pre-registered analysis
+
+You will find here the NMDS and GLMM analysis that we replicated from Gilles et al. (2024). The PERMANOVA and PERMDISP analyses were conducted using PRIMER v7.0.21, and therefore are not available on this document.
+
+We studied the effects of sex (fixed) and pair identity (random), as well as the effects of breeding stage (fixed) and individual identity (random) on the chemical richness, Shannon diversity and volatility of preen oil using linear mixed models (LMM) with Gaussian distributions, using the *lme4* package (Bates et al. 2014). We assessed the significance of fixed effects by checking whether the 95% confidence interval of the beta estimates contained 0 using the broom.mixed package (Bolker et al. 2022), and also checked P-values using the *lmerTest* package (Kuznetsova et al. 2017). The significance of random effects was evaluated by checking whether the 95% confidence intervals of the repeatability estimates contained 0, and by checking the P-value based on permutations, using the *rptr* package (Stoffel et al. 2017). In addition, we measured the variance explained (marginal R$^2$) by each fixed effect using the *partR2* package (Stoffel et al. 2021). We verified the assumptions for LMMs using the *performance* package (Lüdecke et al. 2021). 
+
+
+## Sex and breeding pair effects during nestling-rearing: 
+
+Data = 46 breeding pairs (92 samples) sampled during the nestling-rearing period
+
+```{r}
+# Subset of the Metadata for the sex and breeding pair analyses:
+Pairs_Nrearing <-Metadata%>%   #92 samples
+  filter(pair_brood==1)%>%
+  select(-c(Outliers, F_Connected_to_Outlier, Partner_Connected_to_Outlier, f_sampled_twice, Families, FamiliesOrdered, clutchsize, broodsize))
+```
+
+
+### NMDS plots
+
+Here we create NMDS plots showing the similarity between our samples on a 2D scale. We use Bray-Curtis distances as our similarity measure.
+
+Step 1: Building a Bray-Curtis matrix for our 92 samples
+```{r, message=FALSE, results='hide'}
+ChemdataSex <- Chemdata%>%
+  filter(Sample %in% Pairs_Nrearing$Sample)%>%
+  select(-Sample)# Select the subset of Chemdata from our 92 samples
+bc <- metaMDS(ChemdataSex, distance = "bray") # Bray-Curtis matrix
+```
+Step 2: Checking the stress (how good the distance between samples in actual multivariate distance is represented in two dimensions)
+```{r}
+bc$stress
+```
+Step 3: Plot the NMDS, here by sex
+```{r, warning=FALSE, fig.align='center'}
+bc <- as.data.frame(bc[["points"]]) # Create a data file with the coordinates of each samples in the Bray-Curtis dimension
+# Add the coordinates of each sample in the Subset of the Metadata
+Pairs_Nrearing$MDS1 <- bc$MDS1
+Pairs_Nrearing$MDS2 <- bc$MDS2
+# plot
+ggplot(Pairs_Nrearing) +
+  geom_point(aes(x=MDS1, y=MDS2, color = Sex, size = Sex, shape = Sex)) + 
+  stat_ellipse(aes(MDS1, MDS2, color = Sex), type = "t", level = 0.95) +
+  scale_size_manual(values=c(5,5)) +
+  scale_shape_manual(values=c(16,16)) +
+  scale_color_manual(values = c("#BCBAB7","#19181E")) +
+  theme_void() + 
+  theme(panel.background = element_rect(colour = "grey3", size = 0.3, fill = NA),
+        aspect.ratio = 1,
+        legend.title = element_blank(),
+        legend.position = c(0.08, 0.9),
+        legend.text = element_text(size=8),
+        legend.background = element_rect(size = 0.4, linetype = "solid", color = "grey"),
+        legend.key.size = unit(0.3, "cm"),
+        legend.margin = margin(0,2,2,2),
+        plot.margin=unit(c(1,1,1,1),"cm"))
+```
+We can see here that there seem to be no difference in position or dispersion between male and female samples, as confirmed by the PERMANOVA and PERMDISP analyses on PRIMER.
+
+```{r, echo=FALSE, warning=FALSE, fig.align='center'}
+# sort to have coloured pairs on top of greyed pairs
+Pairs_Nrearing <- Pairs_Nrearing[order(Pairs_Nrearing$Nestbox_ID), ]
+# colour 12 pairs
+paircol <- c(rep("#EAEAEA",34),"#2B70AF","#DBE888","#A7A7D8","#353132","#84398d","#65b331","#85D3C4","#FC9F35","#A37448", "#ffd800","#E2A3D0","#DB3A34")
+# plot
+#tiff("nmds-pair-allpairs-20240313-jpg.jpg", units="in", width=5, height=5, res=600)
+ggplot(Pairs_Nrearing) +
+  geom_point(aes(x=MDS1, y=MDS2, size = Nestbox_ID, color = Nestbox_ID, shape = Nestbox_ID)) +
+  scale_size_manual(values=rep(c(5), 46)) +
+  scale_shape_manual(values=rep(c(16), 46))+
+  scale_color_manual(values = paircol)+
+  theme_void() +
+  theme(panel.background = element_rect(colour = "grey3", size = 0.3, fill = NA),
+        aspect.ratio = 1,
+        legend.position = "none",
+        plot.margin=unit(c(1,1,1,1),"cm"))
+```
+The PERMANOVA analysis also shows that breeding pairs are significantly more similar to each other than random. Therefore, we also create an NMDS plot by breeding pairs.
+To make the figure more easy to read, we choose randomly 12 breeding pairs that will be represented in the plot.
+
+
+### Richness (Number of substances recorded after alignment)
+
+a. Visualisation of the sex difference (within pairs) in terms of chemical richness.
+```{r, message=FALSE, warning=FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(Pairs_Nrearing, aes(x=Sex, y=Richness))+
+  geom_boxplot(data = Pairs_Nrearing %>% filter(Sex=="F"),
+               aes(x=Sex, y=Richness),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = .25, lwd = 0.5,
+               alpha = .8, colour="black", fill = "grey")+
+  geom_boxplot(data = Pairs_Nrearing %>% filter(Sex=="M"), lwd = 0.5,
+               aes(x=Sex, y=Richness),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = .25,
+               alpha = .8, colour="black", fill = "grey8")+
+  geom_line(aes(group=Nestbox_ID), alpha=0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(size = 0.6)+
+  scale_x_discrete(labels=c("Female","Male")) +
+  ylab("Number of Substances")+
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+In this boxplot, each point represents a sample, and each line connects the members of a breeding pair. 
+
+b. Analysis
+
+- Fitting the model
+```{r, warning=FALSE, message=FALSE}
+LMM_Sex_R <- lme4::lmer(formula = "Richness ~ Sex + (1 | Nestbox_ID)",  data = Pairs_Nrearing)
+summary(LMM_Sex_R)
+```
+
+- Finding the P-value for the fixed effect 
+```{r}
+summary(lmerTest::lmer(formula = "Richness ~ Sex + (1 | Nestbox_ID)",  data = Pairs_Nrearing))
+```
+P-value = 0.365 --> non significant. 
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_Sex_R, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of sexM effect: 1.09 --> males have on average 1.09 more substances than females in our samples.
+Confidence interval: [-1.60 ; 3.38] --> includes "0".
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_Sex_R, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of sex: 0.0086
+The sex effect only explains 0.86% of the variation of richness in adults during nestling-rearing. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Richness ~ Sex + (1 | Nestbox_ID),
+    grname = "Nestbox_ID",
+    data = Pairs_Nrearing, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the NestboxID effect: 0.061 --> 6.1% of the variation of richness between samples is due to the variation between pairs in our data. P(perm)= 0.342, non significant.
+The chemical richness is not repeatable between partners. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_Sex_R)
+```
+
+### Diversity (Shannon Index)
+
+a. Visualisation of the sex difference (within pairs) in terms of Shannon diversity. 
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(Pairs_Nrearing, aes(x=Sex, y=Shannon_Index))+
+  geom_boxplot(data = Pairs_Nrearing %>% filter(Sex=="F"),
+               aes(x=Sex, y=Shannon_Index),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = .25, lwd = 0.5,
+               alpha = .8, colour="black", fill = "grey")+
+  geom_boxplot(data = Pairs_Nrearing %>% filter(Sex=="M"), lwd = 0.5,
+               aes(x=Sex, y=Shannon_Index),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = .25,
+               alpha = .8, colour="black", fill = "grey8")+
+  geom_line(aes(group=Nestbox_ID), alpha=0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(size = 0.6)+
+  scale_x_discrete(labels=c("Female","Male")) +
+  ylab("Shannon diversity")+
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r, warning=FALSE, message=FALSE}
+LMM_Sex_D <- lme4::lmer(formula = "Shannon_Index ~ Sex + (1 | Nestbox_ID)",  data = Pairs_Nrearing)
+summary(LMM_Sex_D)
+```
+
+- Finding the P-value for the fixed effect
+```{r, warning=FALSE}
+summary(lmerTest::lmer(formula = "Shannon_Index ~ Sex + (1 | Nestbox_ID)",  data = Pairs_Nrearing))
+```
+P-value = 0.448 --> non significant.  
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_Sex_D, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of sexM effect: 0.038 --> males have an average greater diversity of 0.038 than females in our samples.
+Confidence interval: [-0.059 ; 0.14] --> includes "0".  
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_Sex_D, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of sex: 0.0064
+So the sex only explain 0.64% of the variation of the diversity in our data. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Shannon_Index ~ Sex + (1 | Nestbox_ID),
+    grname = "Nestbox_ID",
+    data = Pairs_Nrearing, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the NestboxID effect: 0 --> 0% of the variation of diversity between samples is due to the variation between pairs in our data. The diversity is not repeatable between partners. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_Sex_D)
+```
+
+### Volatility
+
+a. Visualisation of the sex difference (within pairs) in terms of volatility.
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(Pairs_Nrearing, aes(x=Sex, y=Volatility))+
+  geom_boxplot(data = Pairs_Nrearing %>% filter(Sex=="F"),
+               aes(x=Sex, y=Volatility),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = .25, lwd = 0.5,
+               alpha = .8, colour="black", fill = "grey")+
+  geom_boxplot(data = Pairs_Nrearing %>% filter(Sex=="M"), lwd = 0.5,
+               aes(x=Sex, y=Volatility),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = .25,
+               alpha = .8, colour="black", fill = "grey8")+
+  geom_line(aes(group=Nestbox_ID), alpha=0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(size = 0.6)+
+  scale_x_discrete(labels=c("Female","Male")) +
+  ylab("Proportion of High Volatility Substances (%)")+
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r}
+LMM_Sex_V <- lme4::lmer(formula = "Volatility ~ Sex + (1 | Nestbox_ID)",  data = Pairs_Nrearing)
+summary(LMM_Sex_V)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Volatility ~ Sex + (1 | Nestbox_ID)",  data = Pairs_Nrearing))
+```
+P-value =  0.068 --> non significant. 
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_Sex_V, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of sexM effect: -0.36 --> males have a proportion of on average 0.36 less volatile substances than females in our samples.
+Confidence interval: [-0.75 ; 0.048] --> includes "0".
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_Sex_V, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of sex: 0.0367
+So the sex only explain 3.67% of the variation of volatility in our data. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Volatility ~ Sex + (1 | Nestbox_ID),
+    grname = "Nestbox_ID",
+    data = Pairs_Nrearing, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the NestboxID effect: 0.008 --> 0.8% of the variation of volatility between samples is due to the variation between pairs in our data. P(perm)= 0.515, non significant.
+The volatility is not repeatable between partners. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_Sex_V)
+```
+
+
+
+## Breeding stage and individual identity effects in females: 
+
+Data = 29 individual females (58 samples) sampled both during the incubation and nestling-rearing period
+
+```{r}
+# Subset of the Metadata for the breeding stage and individual identity analyses:
+F_sampled_twice <- Metadata%>%   # 58 samples
+  filter(f_sampled_twice==1,
+         Outliers==0,
+         F_Connected_to_Outlier==0)%>%
+  mutate(Breeding_Stage = as.factor(as.character(Breeding_Stage)))%>%
+  select(-c(pair_brood, Partner_Connected_to_Outlier, Outliers, F_Connected_to_Outlier, Families, FamiliesOrdered, clutchsize, broodsize))
+```
+
+### NMDS plot
+
+Step 1: Building a Bray-Curtis matrix
+```{r, message=FALSE, results='hide'}
+ChemdataBS <- Chemdata%>%
+  filter(Sample %in% F_sampled_twice$Sample)%>%
+  select(-Sample)
+bc <- metaMDS(ChemdataBS, distance = "bray")
+```
+Step 2: Checking the stress 
+```{r}
+bc$stress
+```
+Step 3: Plot the NMDS, here by breeding stage
+```{r, echo=FALSE, fig.align='center'}
+# NMDS breeding stage
+bc <- as.data.frame(bc[["points"]])
+F_sampled_twice$MDS1 <- bc$MDS1
+F_sampled_twice$MDS2 <- bc$MDS2
+# plot
+ggplot(F_sampled_twice) +
+  geom_point(aes(x=MDS1, y=MDS2, color = Breeding_Stage, size = Breeding_Stage, shape = Breeding_Stage)) +
+  stat_ellipse(aes(MDS1, MDS2, color = Breeding_Stage), type = "t", level = 0.95) +
+  scale_size_manual(values=c(5,5)) +
+  scale_shape_manual(values=c(16,16)) +
+  scale_color_manual(values = c("#66cdff","#97704d")) +
+  theme_void() + 
+  theme(panel.background = element_rect(colour = "grey3", size = 0.3, fill = NA),
+        aspect.ratio = 1,
+        legend.title = element_blank(),
+        legend.position = c(0.158, .9),
+        legend.text = element_text(size=8),
+        legend.background = element_rect(size = 0.4, linetype = "solid", color = "grey"),
+        legend.key.size = unit(0.3, "cm"),
+        legend.margin = margin(0,3,2,2),
+        plot.margin=unit(c(1,1,1,1),"cm"))
+```
+
+### Richness
+
+a. Visualisation of the breeding stage difference (within individuals) in terms of chemical richness.
+```{r, message=FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(F_sampled_twice, aes(x=Breeding_Stage, y=Richness))+
+  geom_boxplot(data = F_sampled_twice %>% filter(Breeding_Stage=="Incubation"),
+               aes(x=Breeding_Stage, y=Richness),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = 0.25,lwd = 0.5,
+               alpha = 0.8, colour="black", fill = "#66cdff")+ 
+  geom_boxplot(data = F_sampled_twice %>% filter(Breeding_Stage=="N_Rearing"), lwd = 0.5,
+               aes(x=Breeding_Stage, y=Richness),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = 0.25,
+               alpha = 0.8, colour="black", fill = "#97704d")+
+  geom_line(aes(group=Individual_ID),alpha = 0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(aes(color = Breeding_Stage), alpha = 0.8, size=2.5,show.legend = FALSE)+
+  scale_color_manual(values = c("#66cdff", "#97704d")) +
+  scale_x_discrete(labels=c("Incubation","Nestling-rearing")) +
+  ylab("Number of substances") +
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r}
+LMM_B_Stage_R <- lme4::lmer(formula = "Richness ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice)
+summary(LMM_B_Stage_R)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Richness ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice))
+```
+P-value =  0.004 --> significant **
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_B_Stage_R, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of Nestling-rearing period effect: -4.90 --> females during nestling-rearing have on average 4.897 less substances than females during incubation in our samples.
+Confidence interval: [-8.25 ; -1.70] --> does not includes "0". 
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_B_Stage_R, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of breeding stage: 0.1368
+So the breeding stage explains 13.68% of the variation of richness in our data. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Richness ~ Breeding_Stage + (1 | Individual_ID),
+    grname = "Individual_ID",
+    data = F_sampled_twice, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE)
+```
+Repeatability of the Individual ID effect: 0 --> 0% of the variation of richness between samples is due to the variation between individuals in our data. The chemical richness is not repeatable among individuals. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_B_Stage_R)
+```
+
+### Diversity
+
+a. Visualisation of the breeding stage difference (within individuals) in terms of Shannon diversity.
+```{r, echo=FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(F_sampled_twice, aes(x=Breeding_Stage, y=Shannon_Index))+
+  geom_boxplot(data = F_sampled_twice %>% filter(Breeding_Stage=="Incubation"),
+               aes(x=Breeding_Stage, y=Shannon_Index),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = 0.25,lwd = 0.5,
+               alpha = 0.8, colour="black", fill = "#66cdff")+ 
+  geom_boxplot(data = F_sampled_twice %>% filter(Breeding_Stage=="N_Rearing"), lwd = 0.5,
+               aes(x=Breeding_Stage, y=Shannon_Index),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = 0.25,
+               alpha = 0.8, colour="black", fill = "#97704d")+
+  geom_line(aes(group=Individual_ID),alpha = 0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(aes(color = Breeding_Stage), alpha = 0.8, size=2.5,show.legend = FALSE)+
+  scale_color_manual(values = c("#66cdff", "#97704d")) +
+  scale_x_discrete(labels=c("Incubation","Nestling-rearing")) +
+  ylab("Shannon index") +
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r, warning=FALSE}
+LMM_B_Stage_D <- lme4::lmer(formula = "Shannon_Index ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice)
+summary(LMM_B_Stage_D)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Shannon_Index ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice))
+```
+P-value = 0.0157 --> significant (*)
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_B_Stage_D, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of Nestling-rearing period effect: -0.153 --> females during nestling-rearing have on average 0.153 less diversity than females during incubation in our samples.
+Confidence interval: [-0.268; -0.0479] --> does not includes "0". 
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_B_Stage_D, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of breeding stage: 0.0982
+So the breeding stage explains 9.82% of the variation of the diversity in our data.
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Shannon_Index ~ Breeding_Stage + (1 | Individual_ID),
+    grname = "Individual_ID",
+    data = F_sampled_twice, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the Individual ID effect: 0 --> 0% of the variation of diversity between samples is due to the variation between individuals in our data. The diversity is not repeatable among individuals. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_B_Stage_D)
+```
+
+### Volatility
+
+a. Visualisation of the breeding stage difference (within individuals) in terms of volatility.
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(F_sampled_twice, aes(x=Breeding_Stage, y=Volatility))+
+  geom_boxplot(data = F_sampled_twice %>% filter(Breeding_Stage=="Incubation"),
+               aes(x=Breeding_Stage, y=Volatility),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = 0.25,lwd = 0.5,
+               alpha = 0.8, colour="black", fill = "#66cdff")+ 
+  geom_boxplot(data = F_sampled_twice %>% filter(Breeding_Stage=="N_Rearing"), lwd = 0.5,
+               aes(x=Breeding_Stage, y=Volatility),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = 0.25,
+               alpha = 0.8, colour="black", fill = "#97704d")+
+  geom_line(aes(group=Individual_ID),alpha = 0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(aes(color = Breeding_Stage), alpha = 0.8, size=2.5,show.legend = FALSE)+
+  scale_color_manual(values = c("#66cdff", "#97704d")) +
+  scale_x_discrete(labels=c("Incubation","Nestling-rearing")) +
+  ylab("Proportion of high-volatility substances") +
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r}
+LMM_B_Stage_V <- lme4::lmer(formula = "Volatility ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice)
+summary(LMM_B_Stage_V)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Volatility ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice))
+```
+P-value = 0.0005 --> significant ***
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_B_Stage_V, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of Nestling-rearing period effect: -0.013 --> females during nestling-rearing have a proportion of on average 0.013 less diversity than females during incubation in our samples.
+Confidence interval: [-0.020 ; -0.006] --> does not includes "0". 
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_B_Stage_V, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of breeding stage: 0.2019
+So the breeding stage explains 20.2% of the variation of the volatility in our data.
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Volatility ~ Breeding_Stage + (1 | Individual_ID),
+    grname = "Individual_ID",
+    data = F_sampled_twice, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the Individual ID effect: 0.063 --> 6.3% of the variation of volatility between samples is due to the variation between individuals in our data. P(perm)= 0.411, non significant. The volatility is not repeatable among individuals. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_B_Stage_V)
+```
+
+# Effect sizes (comparisons with pilot paper)
+
+To compare the results from the replication study and the original study, we calculated effect sizes for the LMM analyses (chemical richness, Shannon diversity and volatility). For fixed effects, we calculated a corrected version of the standardised effect size Cohen's d (Cohen 1987) for small sample sizes, the Hedges’ g (Hedges & Olkin, 1985) and its 95% confidence interval, using the *effsize* package (Torchiano & Torchiano, 2020). We used the repeatabilities with their confidence interval as effect sizes for random effects (Stoffel et al. 2017).
+
+```{r, include=FALSE}
+# First we create subsets of the data for the original study (paper 1)):
+# The subsets of the data from the pre-registered analysis (Pairs_Nrearing & F_sampled_twice) need to already be in the R environment for the following code to function.
+
+# Subset of data for the sex and breeding pair analyses
+Pairs_NrearingP1 <- MetadataP1%>%
+  select(-c(daystohatch, sampletime, morning_afternoon, femalesampledtwice))%>%
+  rename(Diversity = Shannon)%>%
+  filter(breeding_stage == "After",
+         completepair == "1")
+
+# Subset of data for the breeding stage and individual identity analyses
+F_sampled_twiceP1 <- MetadataP1%>%
+  select(-c(daystohatch, sampletime, morning_afternoon, completepair))%>%
+  rename(Diversity = Shannon)%>%
+  filter(femalesampledtwice == "1")
+```
+
+## Calculation of Hedges'g effect sizes for both studies
+
+```{r}
+#### Sex effect
+#Original study
+cohen.d(Richness ~ sex, data=Pairs_NrearingP1, hedges.correction=TRUE)
+#Replication study
+cohen.d(Richness ~ Sex, data=Pairs_Nrearing, hedges.correction=TRUE) 
+
+#Original study
+cohen.d(Diversity ~ sex, data=Pairs_NrearingP1, hedges.correction=TRUE) #Replication study
+cohen.d(Shannon_Index ~ Sex, data=Pairs_Nrearing, hedges.correction=TRUE)
+
+#Original study
+cohen.d(Volatility ~ sex, data=Pairs_NrearingP1, hedges.correction=TRUE) 
+#Replication study
+cohen.d(Volatility ~ Sex, data=Pairs_Nrearing, hedges.correction=TRUE) 
+
+### Breeding stage effect
+#Original study
+cohen.d(Richness ~ breeding_stage, data=F_sampled_twiceP1, hedges.correction=TRUE) 
+#Replication study
+cohen.d(Richness ~ Breeding_Stage, data=F_sampled_twice, hedges.correction=TRUE) 
+
+#Original study
+cohen.d(Diversity ~ breeding_stage, data=F_sampled_twiceP1, hedges.correction=TRUE) 
+#Replication study
+cohen.d(Shannon_Index ~ Breeding_Stage, data=F_sampled_twice, hedges.correction=TRUE) 
+
+#Original study
+cohen.d(Volatility ~ breeding_stage, data=F_sampled_twiceP1, hedges.correction=TRUE) 
+#Replication study
+cohen.d(Volatility ~ Breeding_Stage, data=F_sampled_twice, hedges.correction=TRUE) 
+```
+
+## Plot
+
+The values obtained with the cohen.d() function were manually collected into an exel file, which we will use now to plot the results
+```{r}
+eff_sizes <- eff_sizes %>%
+  mutate(Paper=as.character(as.double(Paper)),
+    Response = case_when(
+    Response == "Shannon_Diversity" ~ "Diversity",
+    TRUE ~ Response
+  ))
+# subset of the data for Sex and Richness, Diversity, and Volatility in paper 1 and 2
+subset_sex <- eff_sizes[eff_sizes$Effect == "Sex" & eff_sizes$Response %in% c("Richness", "Diversity", "Volatility") & eff_sizes$Paper %in% c(1, 2), ]
+
+# subset of the data for BreedingStage and Richness, Diversity, and Volatility in paper 1 and 2
+subset_breeding <- eff_sizes[eff_sizes$Effect == "BreedingStage" & eff_sizes$Response %in% c("Richness", "Diversity", "Volatility") & eff_sizes$Paper %in% c(1, 2), ]
+
+# create a new variable for interaction grouping
+subset_sex$Interaction <- interaction(subset_sex$Effect, subset_sex$Response, subset_sex$Paper, sep = "_")
+subset_breeding$Interaction <- interaction(subset_breeding$Effect, subset_breeding$Response, subset_breeding$Paper, sep = "_")
+
+# reorder levels
+subset_sex$Response <- factor(subset_sex$Response, levels = c("Richness", "Diversity", "Volatility"))
+subset_breeding$Response <- factor(subset_breeding$Response, levels = c("Richness", "Diversity", "Volatility"))
+
+# colours
+col_response <- c("Richness" = "#8888D3", 
+                  "Diversity" = "#F7932F",
+                  "Volatility" = "#68BCAC")
+
+# Plot Sex
+sex <- ggplot(subset_sex, aes(x = fct_rev(Response), y = Estimate, color = Response, shape = Paper, size = Paper, group = Interaction)) +
+  geom_pointrange(aes(ymin = int.inf, ymax = int.sup), position = position_dodge(width = 0.6), linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +
+  labs(title = "Sex", y = "Hedges' g") +
+  ylim(-1.4, 2.2) +
+  theme_minimal() +
+  coord_flip() +
+  scale_color_manual(values = col_response) +
+  theme(axis.title.y = element_blank(), legend.position = "none", panel.grid = element_blank(), 
+        axis.line.x = element_line(), panel.border = element_rect(fill = NA),
+        axis.text.y = element_text(size = 11)) +
+  scale_shape_manual(values = c(1, 16))+
+  scale_size_manual(values = c(0.5,0.6))
+
+# Plot Breeding stage
+breeding <- ggplot(subset_breeding, aes(x = fct_rev(Response), y = Estimate, color = Response, shape = Paper, size = Paper, group = Interaction)) +
+  geom_pointrange(aes(ymin = int.inf, ymax = int.sup), position = position_dodge(width = 0.6), linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +
+  labs(title = "Breeding stage", y = "Hedges' g") +
+  ylim(-1.6, 2.0) +
+  theme_minimal() +
+  coord_flip() +
+  scale_color_manual(values = col_response) +
+  theme(axis.title.y = element_blank(), legend.position = "none", panel.grid = element_blank(), 
+        axis.line.x = element_line(), panel.border = element_rect(fill = NA),
+        axis.text.y = element_text(size = 11)) +
+  scale_shape_manual(values = c(1, 16))+
+  scale_size_manual(values = c(0.5,0.6))
+
+# Plot Pair ID
+pair <- ggplot(subset_sex, aes(x = fct_rev(Response), y = Repeatability, color = Response, shape = Paper, size = Paper, group = Interaction)) +
+  geom_pointrange(aes(ymin = Reap.Int.inf, ymax = Reap.Int.sup), position = position_dodge(width = 0.6), linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +
+  labs(title = "Pair identity", y = "Repeatability") +
+  ylim(-0.1, 1) +
+  theme_minimal() +
+  coord_flip() +
+  scale_color_manual(values = col_response) +
+  theme(axis.title.y = element_blank(), legend.position = "none", panel.grid = element_blank(), 
+        axis.line.x = element_line(), panel.border = element_rect(fill = NA),
+        axis.text.y = element_text(size = 11)) +
+  scale_shape_manual(values = c(1, 16))+
+  scale_size_manual(values = c(0.5,0.6))
+
+# Plot Individual ID
+individual <- ggplot(subset_breeding, aes(x = fct_rev(Response), y = Repeatability, color = Response, shape = Paper, size = Paper, group = Interaction)) +
+  geom_pointrange(aes(ymin = Reap.Int.inf, ymax = Reap.Int.sup), position = position_dodge(width = 0.6), linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +
+  labs(title = "Individual identity", y = "Repeatability") +
+  ylim(-0.1, 1) +
+  theme_minimal() +
+  coord_flip() +
+  scale_color_manual(values = col_response) +
+  theme(axis.title.y = element_blank(), legend.position = "none", panel.grid = element_blank(), 
+        axis.line.x = element_line(), panel.border = element_rect(fill = NA),
+        axis.text.y = element_text(size = 11)) +
+  scale_shape_manual(values = c(1, 16))+
+  scale_size_manual(values = c(0.5,0.6))
+
+# Combine the plots using patchwork
+final <- sex + breeding + pair + individual + plot_layout(ncol = 2)
+final
+```
+In this figure, we can see that the confidence intervals around the effect sizes of the GLMM results from the pilot study always overlap the confidence intervals for the effect sizes of the replication. 
+This could mean that the same effect is being tested in both studies, which is what is desired. 
+However, it should be noted that the confidence intervals around the effect sizes of the pilot study are especially wide, therefore making it easier for each pair of intervals to overlap over one another. 
+
+
+# Exploratory analysis
+
+## Spatial analysis of pairs during nestling-rearing:
+
+Gilles et al. (2024) found a high similarity in preen oil composition between breeding partners and proposed that this may be due to their spatial proximity, as they share the same territory and the same food available. To test for the effect of  spatial proximity on preen oil composition, we ran Mantel tests of the spatial versus the Bray-Curtis distance, along with Mantel correlograms (Borcard et al. 2011) and scatterplots for visualisation, using the *vegan* package (Oksanen et al. 2010) in R. This method tests whether chemical similarity covaries with spatial proximity by comparing pairwise chemical distances with pairwise spatial distances. We used all the samples from adult males and females during nestling-rearing for which we had the GPS position of the nestbox (regardless of whether they were part of a complete breeding pair). We tested males (N=42) and females (N=44) separately to control for the effect of breeding partner proximity. 
+
+### Spatial analysis in females:
+
+Preparation of the data
+```{r}
+# Select all samples from females during nestling-rearing (50 samples)
+Females_Nrearing <-Metadata%>%
+  filter(Ageclass=="A",
+         Breeding_Stage == "N_Rearing",
+         Sex == "F",
+         Outliers == 0,
+         Sample != "L280")%>%
+  select(-c(Richness, Shannon_Index, Volatility, pair_brood, f_sampled_twice, Families, FamiliesOrdered, Partner_Connected_to_Outlier, F_Connected_to_Outlier, Outliers, time, daysafterhatch, motherID, fatherID))
+
+# Select the GPS data for the nestboxes in which we sampled females during nestling-rearing
+FGPSNetboxes <- GPSNetboxes%>%
+  filter(Name %in% Females_Nrearing$Nestbox_ID)%>%
+  rename(Nestbox_ID=Name)
+# Select samples from females for which we have GPS data on the nestbox (N = 44 samples)
+Females_Nrearing <- Females_Nrearing%>% 
+  filter(Nestbox_ID %in% FGPSNetboxes$Nestbox_ID)
+df_list <- list(Females_Nrearing, FGPSNetboxes)
+Females_Nrearing <- df_list%>%
+  reduce(full_join, by="Nestbox_ID") # Combine it in a single data frame
+
+# Select the chemical data from the subset of samples
+Chem_F <- Chemdata%>%
+  filter(Sample %in% Females_Nrearing$Sample)
+Chem_F <- subset(Chem_F, select = !apply(Chem_F, 2, function(x) all(x == 0))) # to remove columns where there is only null values
+Females_Nrearing <- list(Females_Nrearing, Chem_F)%>%
+  reduce(full_join, by="Sample") # Add the chemical data to the main data frame
+Chem_F <- Females_Nrearing%>% 
+  select(-c(1:15)) # Chemical data file in the right order
+CoordinatesF <- Females_Nrearing%>% #Coordinates data file in the right order
+  select(c(Easting, Northing))%>%
+  rename(x=Easting, y=Northing)
+Chem_F_det <- resid(lm(as.matrix(Chem_F)~., data=CoordinatesF)) # detrend Chem_F data
+ChemF_det_1 <- Chem_F_det + 1 # we add 1 the the detrend data, because in order to create the bray-curtis matrix, we need all data to be positive
+MatrixF <- vegdist(ChemF_det_1) # Our Bray-curtis distance (dissimilarity) matrix
+```
+Mantel test:
+```{r}
+# For the Mantel test, we need to build the matrix of spatial distances:
+SpatialMatrixF <- dist(CoordinatesF)
+
+mantel(MatrixF, SpatialMatrixF, permutations=1000)
+```
+Mantel correlogram:
+```{r}
+Mantel_correlog_F <- mantel.correlog(MatrixF, XY=CoordinatesF, nperm=9999)
+summary(Mantel_correlog_F)
+FBC <- plot(Mantel_correlog_F)
+title(main="Females")
+```
+Scatterplot:
+```{r, message=FALSE}
+ScatterF <- data.frame(SpatialMatrixF = as.vector(as.matrix(SpatialMatrixF)),
+                 MatrixF = as.vector(as.matrix(MatrixF)))%>%
+  filter(MatrixF != 0)
+ggplot(ScatterF, aes(x=SpatialMatrixF, y=MatrixF))+
+  geom_point(color="grey") +
+  geom_smooth(method = "lm", se = FALSE, color = "grey") +
+  labs(x = "Spatial Distance (m)", y = "Bray-Curtis (chemical) Distance")+
+  ggtitle("Scatterplot of Chemical vs Spatial Distance in Females")
+```
+
+### Spatial analysis in males:
+
+Preparation of the data
+```{r}
+Males_Nrearing <-Metadata%>%
+  filter(Ageclass=="A",
+         Breeding_Stage == "N_Rearing",
+         Sex == "M",
+         Outliers == 0)%>%
+  select(-c(Richness, Shannon_Index, Volatility, pair_brood, f_sampled_twice, Families, FamiliesOrdered, Partner_Connected_to_Outlier, F_Connected_to_Outlier, Outliers, time, daysafterhatch, motherID, fatherID))
+
+MGPSNetboxes <- GPSNetboxes%>%
+  filter(Name %in% Males_Nrearing$Nestbox_ID)%>%
+  rename(Nestbox_ID=Name)
+Males_Nrearing <- Males_Nrearing%>%
+  filter(Nestbox_ID %in% MGPSNetboxes$Nestbox_ID)
+df_list <- list(Males_Nrearing, MGPSNetboxes)
+Males_Nrearing <- df_list%>%
+  reduce(full_join, by="Nestbox_ID") 
+
+Chem_M <- Chemdata%>%
+  filter(Sample %in% Males_Nrearing$Sample)
+Chem_M <- subset(Chem_M, select = !apply(Chem_M, 2, function(x) all(x == 0)))
+Males_Nrearing <- list(Males_Nrearing, Chem_M)%>%
+  reduce(full_join, by="Sample")
+Chem_M <- Males_Nrearing%>%
+  select(-c(1:15))
+CoordinatesM <- Males_Nrearing%>%
+  select(c(Easting, Northing))%>%
+  rename(x=Easting, y=Northing)
+Chem_M_det <- resid(lm(as.matrix(Chem_M)~., data=CoordinatesM)) #detrend matrixF
+Chem_M_det_1 <- Chem_M_det + 1
+MatrixM <- vegdist(Chem_M_det_1) #BC Matrix of detrend data
+```
+Mantel test:
+```{r}
+# For the Mantel test, we need to build the matrix of spatial distances:
+SpatialMatrixM <- dist(CoordinatesM, diag=T)
+
+mantel(MatrixM, SpatialMatrixM, permutations=1000)
+```
+Mantel correlogram:
+```{r}
+Mantel_correlog_M <- mantel.correlog(MatrixM, XY=CoordinatesM, nperm=9999)
+summary(Mantel_correlog_M)
+MBC <- plot(Mantel_correlog_M)
+title(main="Males")
+```
+Scatterplot:
+```{r, message=FALSE}
+ScatterM <- data.frame(SpatialMatrixM = as.vector(as.matrix(SpatialMatrixM)),
+                       MatrixM = as.vector(as.matrix(MatrixM)))%>%
+  filter(MatrixM != 0)
+ggplot(ScatterM, aes(x=SpatialMatrixM, y=MatrixM))+
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "grey8") +
+  labs(x = "Spatial Distance (m)", y = "Bray-Curtis (chemical) Distance")+
+  ggtitle("Scatterplot of Chemical vs Spatial Distance in Males")
+```
+
+## Time difference analysis
+A higher similarity between breeding partners could also be the result of a temporal autocorrelation, as breeding partners were sampled at around the same date and time. To control for this, we extracted the pairwise Bray-Curtis similarities of females (N =  50) and males (N = 48) separately, and tested for the effect of the time difference (fixed effect) between each pair of samples on the Bray-Curtis similarity with generalised linear mixed models (GLMM) with beta distribution using the glmmTMB package (Magnusson et al. 2017) in R. 
+
+### Time difference analysis in females
+
+Preparation of the data
+```{r}
+# Select samples from all females during nestling-rearing (50 samples)
+Females <-Metadata%>%
+  filter(Ageclass=="A",
+         Breeding_Stage == "N_Rearing",
+         Sex == "F",
+         Outliers == 0,
+         Sample != "L280")%>%
+  select(-c(Richness, Shannon_Index, Volatility, pair_brood, f_sampled_twice, Families, 
+            FamiliesOrdered, Partner_Connected_to_Outlier, F_Connected_to_Outlier, Outliers, 
+            daysafterhatch, motherID, fatherID))%>%
+  mutate(hour_time = (date - 1)*24 + time)%>%
+  arrange(Sample)
+
+# Create a time matrix, containing the time difference in sampling between each female dyad
+
+time_diff <- function(x, y) {
+  return(abs(x - y))  # Use "abs()" to get the absolute value of the time difference
+}
+
+Time_F <- outer(Females$hour_time, Females$hour_time, FUN = time_diff)
+Time_F <- as.matrix(Time_F)
+Time_F <- as.data.frame(Time_F)
+colnames(Time_F) <- Females$Sample
+rownames(Time_F) <- Females$Sample
+n <- nrow(Time_F)
+for (i in 1:n) { # Remove the upper triangular part of the matrix
+  for (j in 1:n) {
+    if (i < j) {
+      Time_F[i, j] <- NA}}}
+for (i in 1:n) { # Remove the values from the main diagonal
+  for (j in 1:n) {
+    if (i == j) {
+      Time_F[i, j] <- 0}}}
+
+```
+```{r}
+# Create a chemical matrix containing the Bray-Curtis dissimilarity of each female dyad
+
+ChemdataF <- Chemdata%>%
+  filter(Sample %in% Females$Sample)%>%
+  arrange(Sample)%>% # make sure samples are in the same order as in the Metadata
+  select(-Sample) # Select the subset of chemical data
+
+BC_F <- vegdist(ChemdataF) # Calculate Bray-Curtis dissimilarity matrix
+BC_F <- as.matrix(BC_F)
+BC_F <- as.data.frame(BC_F)
+colnames(BC_F) <- Females$Sample
+rownames(BC_F) <- Females$Sample
+n <- nrow(BC_F)
+for (i in 1:n) { # Remove the upper triangular part of the matrix
+  for (j in 1:n) {
+    if (i < j) {
+      BC_F[i, j] <- NA}}}
+for (i in 1:n) { # Remove the values from the main diagonal
+  for (j in 1:n) {
+    if (i == j) {
+      BC_F[i, j] <- 0}}}
+
+#Transform Bray-Curtis matrix in right format
+BC_F <- as.matrix(BC_F)
+
+key<-data.frame(Sample=Females$Sample, Order=Females$Sample)
+
+all(rownames(BC_F)==key$Sample) # Control if the samples are in the same order in the matrix and in the Metadata
+```
+
+Dyadic data
+```{r, message=FALSE}
+# Create a data frame giving for each dyad the time difference in sampling and the Bray-Curtis dissimilarity
+
+bc_f <- c(as.dist(BC_F))
+time_f <- c(as.dist(Time_F))
+
+
+data.dyad<-data.frame(BC_Dissimilarity=bc_f,
+                      Time_Diff=time_f)
+
+list<-expand.grid(key$Sample,key$Sample) 
+list<-list[which(list$Var1!=list$Var2),] 
+list$key <- apply(list, 1, function(x)paste(sort(x), collapse='')) 
+list<-subset(list, !duplicated(list$key)) 
+i=50L # sanity check
+BC_F[which(rownames(BC_F)==list$Var1[i]),which(colnames(BC_F)==list$Var2[i])]==bc_f[i]
+data.dyad$SampleA<-list$Var2
+data.dyad$SampleB<-list$Var1
+
+data.dyad<-data.dyad[which(data.dyad$SampleA!=data.dyad$SampleB),] # sanity check
+
+Pairwise_F <- as_tibble(data.dyad)%>%
+  dplyr::select("SampleB", everything())%>%
+  dplyr::select("SampleA", everything())
+```
+
+Analysis and plots
+```{r}
+ggplot(Pairwise_F)+
+  geom_point(aes(x=Time_Diff, y=BC_Dissimilarity), color = "grey")+
+  geom_smooth(aes(x=Time_Diff, y=BC_Dissimilarity), color= "black", se=F)
+
+Model_TimeDiff <- glmmTMB(BC_Dissimilarity ~ Time_Diff,
+                          family = beta_family(link = "logit"),
+                          data=Pairwise_F)
+summary(Model_TimeDiff)
+confint(Model_TimeDiff)
+```
+The time difference between sampling impacts significantly the chemical similarity of preen oil among females, with a slope of 0.00058
+
+### Time difference analysis in males
+
+Preparation of the data
+```{r}
+# Select samples from all males during nestling-rearing (48 samples)
+Males <-Metadata%>%
+  filter(Ageclass=="A",
+         Breeding_Stage == "N_Rearing",
+         Sex == "M",
+         Outliers == 0)%>%
+  select(-c(Outliers, F_Connected_to_Outlier, Partner_Connected_to_Outlier, 
+            f_sampled_twice, Families, FamiliesOrdered, clutchsize, broodsize, 
+            Ageclass, motherID, fatherID, pair_brood, Breeding_Stage))%>%
+  mutate(hour_time = (date - 1)*24 + time)%>%
+  arrange(Sample)
+
+# Create a time matrix, containing the time difference in sampling between each male dyad
+
+time_diff <- function(x, y) {
+  return(abs(x - y))  # Use "abs()" to get the absolute value of the time difference
+}
+
+Time_M <- outer(Males$hour_time, Males$hour_time, FUN = time_diff)
+Time_M <- as.matrix(Time_M)
+Time_M <- as.data.frame(Time_M)
+colnames(Time_M) <- Males$Sample
+rownames(Time_M) <- Males$Sample
+n <- nrow(Time_M)
+for (i in 1:n) { # Remove the upper triangular part of the matrix
+  for (j in 1:n) {
+    if (i < j) {
+      Time_M[i, j] <- NA}}}
+for (i in 1:n) { # Remove the values from the main diagonal
+  for (j in 1:n) {
+    if (i == j) {
+      Time_M[i, j] <- 0}}}
+
+```
+```{r}
+# Create a chemical matrix containing the Bray-Curtis dissimilarity of each male dyad
+
+ChemdataM <- Chemdata%>%
+  filter(Sample %in% Males$Sample)%>%
+  arrange(Sample)%>% # make sure samples are in the same order as in the Metadata
+  select(-Sample) # Select the subset of chemical data
+
+BC_M <- vegdist(ChemdataM) # Calculate Bray-Curtis dissimilarity matrix
+BC_M <- as.matrix(BC_M)
+BC_M <- as.data.frame(BC_M)
+colnames(BC_M) <- Males$Sample
+rownames(BC_M) <- Males$Sample
+n <- nrow(BC_M)
+for (i in 1:n) { # Remove the upper triangular part of the matrix
+  for (j in 1:n) {
+    if (i < j) {
+      BC_M[i, j] <- NA}}}
+for (i in 1:n) { # Remove the values from the main diagonal
+  for (j in 1:n) {
+    if (i == j) {
+      BC_M[i, j] <- 0}}}
+
+#Transform Bray-Curtis matrix in right format
+BC_M <- as.matrix(BC_M)
+
+key<-data.frame(Sample=Males$Sample, Order=Males$Sample)
+
+all(rownames(BC_M)==key$Sample) # Control if the samples are in the same order in the matrix and Metadata
+```
+
+Dyadic data
+```{r, message=FALSE}
+# Create a data frame giving for each dyad the time difference in sampling and the Bray-Curtis dissimilarity
+
+bc_m <- c(as.dist(BC_M))
+time_m <- c(as.dist(Time_M))
+
+
+data.dyad<-data.frame(BC_Dissimilarity=bc_m,
+                      Time_Diff=time_m)
+
+list<-expand.grid(key$Sample,key$Sample) 
+list<-list[which(list$Var1!=list$Var2),] 
+list$key <- apply(list, 1, function(x)paste(sort(x), collapse='')) 
+list<-subset(list, !duplicated(list$key)) 
+i=48L # sanity check
+BC_M[which(rownames(BC_M)==list$Var1[i]),which(colnames(BC_M)==list$Var2[i])]==bc_m[i]
+data.dyad$SampleA<-list$Var2
+data.dyad$SampleB<-list$Var1
+
+data.dyad<-data.dyad[which(data.dyad$SampleA!=data.dyad$SampleB),] # sanity check
+
+Pairwise_M <- as_tibble(data.dyad)%>%
+  dplyr::select("SampleB", everything())%>%
+  dplyr::select("SampleA", everything())
+```
+
+Analysis and plots
+```{r}
+ggplot(Pairwise_M)+
+  geom_point(aes(x=Time_Diff, y=BC_Dissimilarity))+
+  geom_smooth(aes(x=Time_Diff, y=BC_Dissimilarity), color= "black", se=F)
+
+Model_TimeDiff <- glmmTMB(BC_Dissimilarity ~ Time_Diff,
+                          family = beta_family(link = "logit"),
+                          data=Pairwise_M)
+summary(Model_TimeDiff)
+```
+The time difference between sampling does not impact significantly the chemical similarity of preen oil among males
+
+## Life stage difference
+
+We tested whether preen oil composition differs between nestlings and adults, and whether it contains family signatures (i.e. high similarity between family members). We used samples from 16 broods (100 samples, 31 from adults and 69 from nestlings) collected during nestling-rearing, and employed the same analytical method as for the replication analysis. We tested the effect of life stage (fixed effect) and nest identity (random effect) on on beta diversity (Bray-Curtis dissimilarities) using PERMANOVA, PERMDISP (these analyses were ran on PRIMER v7.0.21 and are thus not included in this document) and NMDS, and on chemical richness, Shannon diversity and volatility using LMMs.
+
+```{r}
+# Create a subset of the Metadata containing all samples taken from nestboxes for which we have sampled at leas one parent and nestlings
+Families <-Metadata%>%      #100 samples
+  filter(Families==1)%>%
+  select(-c(Outliers, F_Connected_to_Outlier, Partner_Connected_to_Outlier, f_sampled_twice, pair_brood))
+```
+
+### NMDS plot
+
+Bray-Curtis matrix
+```{r, include=FALSE}
+ChemdataF <- Chemdata%>%
+  filter(Sample %in% Families$Sample)%>%
+  select(-Sample)
+bc <- metaMDS(ChemdataF, distance = "bray")
+```
+Check the stress (how good the distance between samples in actual multivariate distance is represented in two dimensions)
+```{r}
+bc$stress
+```
+
+```{r, echo=FALSE, fig.align='center'}
+# NMDS Life stage
+
+bc <- as.data.frame(bc[["points"]])
+Families$MDS1 <- bc$MDS1
+Families$MDS2 <- bc$MDS2
+# plot
+#tiff("nmds-lifestage-20240313-jpg.jpg", units="in", width=5, height=5, res=600)
+ggplot(Families) +
+  geom_point(aes(x=MDS1, y=MDS2, color = Ageclass, size = Ageclass, shape = Ageclass)) +
+  stat_ellipse(aes(MDS1, MDS2, color = Ageclass), type = "t", level = 0.95) +
+  scale_size_manual(values=c(5,5)) +
+  scale_shape_manual(values=c(16,16)) +
+  scale_color_manual(values = c("#19181E","#C1AC8E")) +
+  theme_void() + 
+  theme(panel.background = element_rect(colour = "grey3", size = 0.3, fill = NA),
+        aspect.ratio = 1,
+        legend.title = element_blank(),
+        legend.position = c(0.08, .9),
+        legend.text = element_text(size=8),
+        legend.background = element_rect(size = 0.4, linetype = "solid", color = "grey"),
+        legend.key.size = unit(0.3, "cm"),
+        legend.margin = margin(0,3,2,2),
+        plot.margin=unit(c(1,1,1,1),"cm"))
+```
+NMDS plot between Life stages
+
+```{r, echo=FALSE, fig.align='center'}
+# NMDS plot by families
+
+# Sort families to have coloured families on top of greyed families
+Families <- Families[order(Families$Nestbox_ID), ] 
+# colour randomly 6 families
+familycol <- c(rep("#EAEAEA", 9),"#2B70AF","#A7A7D8","#EAEAEA","#ffd800","#FC9F35","#85D3C4","#353132")
+# plot
+#tiff("nmds-families-20240313-jpg.jpg", units="in", width=5, height=5, res=600)
+ggplot(Families) +
+  geom_point(aes(x=MDS1, y=MDS2, size = Sex, color = Nestbox_ID, shape = Sex)) +
+  scale_size_manual(values=c(6,4,5))+
+  scale_shape_manual(values=c(18,15,16))+
+  scale_color_manual(values = familycol)+
+  theme_void() +
+  theme(panel.background = element_rect(colour = "grey3", size = 0.3, fill = NA),
+        aspect.ratio = 1,
+        legend.position = "none",
+        plot.margin=unit(c(1,1,1,1),"cm"))
+```
+NMDS plot by Family
+
+### Richness
+
+a. Visualisation of the life-stage difference (within families) in terms of chemical richness.
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(Families, aes(x=Ageclass, y=Richness, fill=Ageclass))+
+  geom_boxplot(colour="black")+
+  scale_fill_manual(values = c("A"= "#19181E", "N"="#C1AC8E"))+
+  labs(fill = "Life Stage")+
+  scale_x_discrete(labels=c("Adult","Nestling")) +
+  ylab("Chemical Richness")+
+  xlab("Life Stage")+
+  ggtitle("Chemical richness in relation with Life stage during nestling-rearing")
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r, warning=FALSE, message=FALSE}
+LMM_LifeStage_R <- lme4::lmer(formula = "Richness ~ Ageclass + (1 | Nestbox_ID)",  data = Families)
+summary(LMM_LifeStage_R)
+```
+
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Richness ~ Ageclass + (1 | Nestbox_ID)",  data = Families))
+```
+P-value = 0.342 --> non significant. 
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_LifeStage_R, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of sexM effect: -1.15 --> Nestlings have on average 1.15 less substances than adults in our samples.
+Confidence interval: [-3.33 ; 1.07] --> includes "0".
+
+- Finding the marginal R$^2$ (fixed effect) 
+```{r}
+partR2(LMM_LifeStage_R, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of Life stage: 0.0077
+The Life stage effect only explains 0.77% of the variation of richness in our samples during nestling-rearing. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Richness ~ Ageclass + (1 | Nestbox_ID),
+    grname = "Nestbox_ID",
+    data = Families, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the NestboxID effect: 0.17 --> 17% of the variation of richness between samples is due to the variation between families in our data. P(perm)= 0.007, significant.
+The chemical richness is repeatable between families. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_LifeStage_R)
+```
+
+### Diversity (Shannon Index)
+
+a. Visualisation of the life-stage difference (within families) in terms of Shannon diversity.
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(Families, aes(x=Ageclass, y=Shannon_Index, fill=Ageclass))+
+  geom_boxplot(colour="black")+
+  scale_fill_manual(values = c("A"= "#19181E", "N"="#C1AC8E"))+
+  labs(fill = "Life Stage")+
+  scale_x_discrete(labels=c("Adult","Nestling")) +
+  ylab("Chemical Shannon Diversity")+
+  xlab("Life Stage")+
+  ggtitle("Chemical Shannon Diversity in relation with Life stage during nestling-rearing")
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r, warning=FALSE, message=FALSE}
+LMM_LifeStage_D <- lme4::lmer(formula = "Shannon_Index ~ Ageclass + (1 | Nestbox_ID)",  data = Families)
+summary(LMM_LifeStage_D)
+```
+
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Shannon_Index ~ Ageclass + (1 | Nestbox_ID)",  data = Families))
+```
+P-value = 0.269 --> non significant. 
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_LifeStage_D, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of Life stage Nestling effect: -0.0458 --> Nestlings have on average a preen oil on average 0.0458 less diverse (Shannon index units) than adults in our samples.
+Confidence interval: [-0.130 ; 0.0350] --> includes "0".
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_LifeStage_D, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of Life stage: 0.0115
+The Life stage effect only explains 1.15% of the variation of diversity in our samples during nestling-rearing. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Shannon_Index ~ Ageclass + (1 | Nestbox_ID),
+    grname = "Nestbox_ID",
+    data = Families, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the NestboxID effect: 0.077 --> 7.7% of the variation of diversity between samples is due to the variation between families in our data. P(perm)= 0.1, non-significant.
+The Shannon diversity is not repeatable between families. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_LifeStage_D)
+```
+
+### Volatility
+
+a. Visualisation of the life-stage difference (within families) in terms of volatility.
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(Families, aes(x=Ageclass, y=Volatility, fill=Ageclass))+
+  geom_boxplot(colour="black")+
+  scale_fill_manual(values = c("A"= "#19181E", "N"="#C1AC8E"))+
+  labs(fill = "Life Stage")+
+  scale_x_discrete(labels=c("Adult","Nestling")) +
+  ylab("Chemical Volatility")+
+  xlab("Life Stage")+
+  ggtitle("Chemical Volatility in relation with Life stage during nestling-rearing")
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r, warning=FALSE, message=FALSE}
+LMM_LifeStage_V <- lme4::lmer(formula = "Volatility ~ Ageclass + (1 | Nestbox_ID)",  data = Families)
+summary(LMM_LifeStage_V)
+```
+
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Volatility ~ Ageclass + (1 | Nestbox_ID)",  data = Families))
+```
+P-value = 6.34e-05 --> significant. 
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_LifeStage_V, conf.int = TRUE, conf.method = 'boot') 
+```
+$\beta$ estimate of Life stage Nestling effect: -0.007 --> Nestlings have on average a preen oil on average 0.006 less diverse (Shannon index units) than adults in our samples.
+Confidence interval: [-0.010 ; -0.003] --> does not include "0".
+
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_LifeStage_V, nboot = 1000) 
+```
+Marginal R$^2$ for the effect of Life stage: 0.1205
+The Life stage effect explains 12% of the variation of volatility in our samples during nestling-rearing. 
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Volatility ~ Ageclass + (1 | Nestbox_ID),
+    grname = "Nestbox_ID",
+    data = Families, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+Repeatability of the NestboxID effect: 0.247 --> 24.7% of the variation of volatility between samples is due to the variation between families in our data. P(perm)= 0.002, significant.
+The Volatility is repeatable between families. 
+
+- Model diagnostic
+```{r}
+check_model(LMM_LifeStage_V)
+```
+
+## Nestling-Adult similarities
+
+We tested whether the preen oil from nestlings is more similar to that of their mother or father, to that of an adult female or male other than their mother and father, and whether it was more similar to that of their mother or father more so than to other adult females or males in the population. 
+First, we extracted the pairwise Bray-Curtis similarity for each nestling-adult pair from the Bray-Curtis matrix, and separated them between nestling-mother, nestling-father, nestling-adult female and nestling-adult male pairs. We could then study the effect of adult and parent sex, as well as the effect of being the mother/father (fixed effect) on the similarity between samples, while controlling for the effect of nest identity (random effect) and nestling identity (random effect nested within nest identity). As Bray-Curtis similarity data ranges between 0 and 1, we decided to use generalised linear mixed models (GLMM) with Beta distribution using the *glmmTMB* package (Magnusson et al. 2017) on R. However this method does not allow us to measure the repeatability for random effects. Instead, to estimate the importance of random effects, we ran models with and without each random effect and compared them with a chi-square test using the *stats* package. 
+
+### Creating a Pairwise-Similarity data file
+This code follows the code from Raulo et al. (2021) (full reference in the references of the main paper)
+```{r, message=FALSE}
+#### Create Bray-Curtis matrix with the Families samples
+
+# Recreate the subset of data containing the 100 family samples ordered
+Metadata_Families <- Metadata%>% 
+  filter(Families == 1,
+         Outliers == 0)%>%
+  select(c(Sample, Individual_ID, Nestbox_ID, 
+  Ageclass, Sex, Families, FamiliesOrdered))%>%
+  rename(Order = FamiliesOrdered)
+
+ChemdataF <- Chemdata%>%
+  filter(Sample %in% Metadata_Families$Sample)%>%
+  select(-Sample) # Select the subset of chemical data
+
+BC_Families <- vegdist(ChemdataF) 
+BC_Families <- as.matrix(BC_Families)
+BC_Families <- 1-BC_Families # to have bray-curtis similarity instead of dissimilarity
+BC_Families <- as.data.frame(BC_Families)
+colnames(BC_Families) <- Metadata_Families$Sample
+rownames(BC_Families) <- Metadata_Families$Sample
+n <- nrow(BC_Families)
+for (i in 1:n) { # Remove the upper triangular part of the matrix
+  for (j in 1:n) {
+    if (i < j) {
+      BC_Families[i, j] <- NA}}}
+for (i in 1:n) { # Remove the values from the main diagonal
+  for (j in 1:n) {
+    if (i == j) {
+      BC_Families[i, j] <- 0}}}
+
+#Transform Bray-Curtis in right format
+BC_Families <- as.matrix(BC_Families)
+
+key<-data.frame(Sample=Metadata_Families$Sample, Order=Metadata_Families$Order)
+
+all(rownames(BC_Families)==key$Sample) # Control if the samples are in the same order in the matrix and in the Metadata
+```
+
+```{r, message=FALSE}
+####Create a binary matrix, value = 1 when the samples come from the same nestbox, 0 otherwise
+
+# 1. Create data frame  with each Individual name (SampleID) and their nestbox (NestID) as character (here nothing to change)
+NestID_frame <- Metadata_Families[,c("Sample", "Nestbox_ID")]
+
+# 2. Create an empty numeric matrix to fill with distances
+NestM <- array(0,c(nrow(NestID_frame),nrow(NestID_frame)))
+
+# 3. Derive matrix with binary NestID similarity between each sample (they are either from the same nest or they are not)
+for(i in 1:nrow(NestID_frame)){
+  for(j in 1:nrow(NestID_frame)){ 
+    if(NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestM[i,j]= 1
+    } else{
+      NestM[i,j]= 0
+    }
+  }
+} 
+all(rownames(NestM)==key$Sample)
+rownames(NestM)<-key$Sample
+colnames(NestM)<-key$Sample
+
+```
+
+```{r, message=FALSE}
+#### Create a matrix with the BC distances
+# 1. Create an empty numeric matrix to fill with nestID
+NestIDM <-array(as.character(NA),c(nrow(NestID_frame),nrow(NestID_frame)))
+
+# 2. Derive matrix with binary NestID similarity between each sample
+for(i in 1:nrow(NestID_frame)){
+  for(j in 1:nrow(NestID_frame)){
+    if(NestID_frame$Nestbox_ID[i]=="15" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "15"}
+    if(NestID_frame$Nestbox_ID[i]=="26" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "26"}
+    if(NestID_frame$Nestbox_ID[i]=="121" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "121"}
+    if(NestID_frame$Nestbox_ID[i]=="151" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "151"}
+    if(NestID_frame$Nestbox_ID[i]=="222" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "222"}
+    if(NestID_frame$Nestbox_ID[i]=="301" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "301"}
+    if(NestID_frame$Nestbox_ID[i]=="308" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "308"}
+    if(NestID_frame$Nestbox_ID[i]=="447" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "447"}
+    if(NestID_frame$Nestbox_ID[i]=="512" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "512"}
+    if(NestID_frame$Nestbox_ID[i]=="715" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "715"}
+    if(NestID_frame$Nestbox_ID[i]=="39L" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "39L"}
+    if(NestID_frame$Nestbox_ID[i]=="519A" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "519A"}
+    if(NestID_frame$Nestbox_ID[i]=="E" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "E"}
+    if(NestID_frame$Nestbox_ID[i]=="M" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "M"}
+    if(NestID_frame$Nestbox_ID[i]=="O" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "O"}
+    if(NestID_frame$Nestbox_ID[i]=="Y" & NestID_frame$Nestbox_ID[i]==NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "Y"}
+    if(NestID_frame$Nestbox_ID[i]!=NestID_frame$Nestbox_ID[j]){
+      NestIDM[i,j]= "NA"}
+  }
+}
+
+
+all(rownames(NestIDM)==key$Sample)
+rownames(NestIDM)<-key$Sample
+colnames(NestIDM)<-key$Sample
+```
+
+```{r, message=FALSE}
+####Create a combination-factor matrix for Life Stage (Adult vs Nestling)
+
+# 1. Create data frame  with each Individual name (SampleID) and their Life stage (ageclass) as character (here nothing to change)
+LifeStage_frame <- Metadata_Families[,c("Sample", "Ageclass")]
+
+# 2. Create an empty character matrix to fill with characters
+AGEM<-array(as.character(NA),c(nrow(LifeStage_frame),nrow(LifeStage_frame)))
+
+for(i in 1:nrow(LifeStage_frame)){
+  for(j in 1:nrow(LifeStage_frame)){ 
+    if(LifeStage_frame$Ageclass[i]=="A" & LifeStage_frame$Ageclass[i]==LifeStage_frame$Ageclass[j]){
+      AGEM[i,j]= "AA"}
+    if(LifeStage_frame$Ageclass[i]=="N" & LifeStage_frame$Ageclass[i]==LifeStage_frame$Ageclass[j]){
+      AGEM[i,j]= "NN"}
+    if( LifeStage_frame$Ageclass[i]!=LifeStage_frame$Ageclass[j]){
+      AGEM[i,j]= "AN"}
+  }
+}
+
+rownames(AGEM)<-key$Sample
+colnames(AGEM)<-key$Sample
+all(rownames(AGEM)==key$Sample)
+```
+```{r, message=FALSE}
+####Create a combination-factor matrix for Sexes 
+
+Sex_frame<-Metadata_Families[,c("Sample","Sex")]
+SEXM<-array(as.character(NA),c(nrow(Sex_frame),nrow(Sex_frame)))
+
+for(i in 1:nrow(Sex_frame)){
+  for(j in 1:nrow(Sex_frame)){ 
+    if(Sex_frame$Sex[i]=="F" & Sex_frame$Sex[i]==Sex_frame$Sex[j]){
+      SEXM[i,j]= "FF"}
+    if(Sex_frame$Sex[i]=="M" & Sex_frame$Sex[i]==Sex_frame$Sex[j]){
+      SEXM[i,j]= "MM"}
+    if(Sex_frame$Sex[i]=="NA" & Sex_frame$Sex[i]==Sex_frame$Sex[j]){
+      SEXM[i,j]= "NN"}
+    if(Sex_frame$Sex[i]=="F" & Sex_frame$Sex[j]=="M"){
+      SEXM[i,j]= "FM"}
+    if(Sex_frame$Sex[j]=="F" & Sex_frame$Sex[i]=="M"){
+      SEXM[i,j]= "FM"}
+    if(Sex_frame$Sex[i]=="F" & Sex_frame$Sex[j]=="NA"){
+      SEXM[i,j]= "NF"}
+    if(Sex_frame$Sex[j]=="F" & Sex_frame$Sex[i]=="NA"){
+      SEXM[i,j]= "NF"}
+    if(Sex_frame$Sex[i]=="M" & Sex_frame$Sex[j]=="NA"){
+      SEXM[i,j]= "NM"}
+    if(Sex_frame$Sex[j]=="M" & Sex_frame$Sex[i]=="NA"){
+      SEXM[i,j]= "NM"}
+  }
+}
+rownames(SEXM)<-key$Sample
+colnames(SEXM)<-key$Sample
+```
+
+```{r, message=FALSE}
+#### Create dyadic data
+
+bc_families <- c(as.dist(BC_Families))
+nest <- c(as.dist(NestM))
+age <- c(AGEM[lower.tri(AGEM)])
+sex<-c(SEXM[lower.tri(SEXM)])
+nestID<-c(NestIDM[lower.tri(SEXM)])
+
+data.dyad<-data.frame(BC_Similarity=bc_families,
+                      Nest_Similarity=nest,
+                      NestID=nestID,
+                      Age_combination=age,
+                      Sex_combination=sex)
+
+list<-expand.grid(key$Sample,key$Sample) 
+list<-list[which(list$Var1!=list$Var2),] 
+list$key <- apply(list, 1, function(x)paste(sort(x), collapse='')) 
+list<-subset(list, !duplicated(list$key)) 
+i=90 # sanity check
+BC_Families[which(rownames(BC_Families)==list$Var1[i]),which(colnames(BC_Families)==list$Var2[i])]==bc_families[i]
+data.dyad$SampleA<-list$Var2
+data.dyad$SampleB<-list$Var1
+
+data.dyad<-data.dyad[which(data.dyad$SampleA!=data.dyad$SampleB),] # sanity check
+
+Pairwise_Data <- as_tibble(data.dyad)%>%
+  dplyr::select("SampleB", everything())%>%
+  dplyr::select("SampleA", everything())
+```
+
+### Mother VS father analysis
+```{r}
+Parent_Data <- Pairwise_Data%>%
+  mutate(Relationship = case_when(
+    Sex_combination == 'NM' & Nest_Similarity == '1' ~ 'Father',
+    Sex_combination == 'NF' & Nest_Similarity == '1' ~ 'Mother'
+  ))%>%
+  filter(Relationship != "NA")
+Age_of_Samples <- Metadata_Families%>%
+  select(Sample, Ageclass)%>%
+  rename(SampleA = Sample)
+df_list <- list(Parent_Data, Age_of_Samples)
+Parent_Data <- df_list%>%
+  reduce(full_join, by="SampleA")%>%
+  filter(SampleB != "NA")%>%
+  mutate(SampleB = as.character(as.factor(SampleB)),
+    Nestling = ifelse(Ageclass == 'A', SampleB, SampleA))%>%
+  select(-c(Ageclass, Nest_Similarity, Age_combination, Sex_combination))
+```
+
+#### Analyse
+
+- Fittig model and getting the P-value
+```{r}
+Model_Parent_Nestling <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID) + (1 | NestID:Nestling),
+                                family = beta_family(link = "logit"),
+                                data=Parent_Data)
+summary(Model_Parent_Nestling) #AIC = -380.8
+```
+P-value = 0.0235, significant. Mother's preen oil composition is slightly more distant to their nestlings preen oil than the father's preen oil.
+```{r}
+#Conversion in linear unit
+mu_intercept <- 1.72361
+mu_ParentMother <- -0.12897
+plogis(mu_intercept + mu_ParentMother) - plogis(mu_intercept)
+```
+The distance Mother-Nestling is 0.017 higher than the distance Father-Nestling in Bray-Curtis units.
+
+- Confidence intervals
+```{r}
+tidy(Model_Parent_Nestling, conf.int = TRUE, conf.method = "profile")
+```
+$\beta$ estimate of the distance to the Mother effect: -0.129 (Beta family unit)
+Confidence interval: [-0.242 ; -0.016] --> does not include "0".
+
+- AIC without Random effects
+```{r}
+Model_PN_noRandomeff <- glmmTMB(BC_Similarity ~ Relationship,
+                                family = beta_family(link = "logit"),
+                                data=Parent_Data)
+
+Model_PN_NestID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID),
+                                 family = beta_family(link = "logit"),
+                                 data=Parent_Data)
+
+Model_PN_NestlingID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID:Nestling),
+                             family = beta_family(link = "logit"),
+                             data=Parent_Data)
+
+anova(Model_Parent_Nestling, Model_PN_noRandomeff, Model_PN_NestID, Model_PN_NestlingID)
+```
+The stronger AIC is for the full model.
+There is a significant difference between the model without random effects and the model without the NestlingID effect, but no with the model without NestID effect. The NestlingID effect seems to be the random effect with the most impact.
+
+### Mother VS other adult females analysis
+```{r}
+MotherVSOtherF_Data <- Pairwise_Data%>%
+  mutate(Relationship = case_when(
+    Sex_combination == 'NF' & Nest_Similarity == '0' ~ 'OtherF',
+    Sex_combination == 'NF' & Nest_Similarity == '1' ~ 'Mother'
+  ))%>%
+  filter(Relationship != "NA")
+Age_of_Samples <- Metadata_Families%>%
+  select(Sample, Ageclass)%>%
+  rename(SampleA = Sample)
+df_list <- list(MotherVSOtherF_Data, Age_of_Samples)
+MotherVSOtherF_Data <- df_list%>%
+  reduce(full_join, by="SampleA")%>%
+  filter(SampleB != "NA")%>%
+  mutate(SampleB = as.character(as.factor(SampleB)),
+    Nestling = ifelse(Ageclass == 'A', SampleB, SampleA))%>%
+  select(-c(Ageclass, Nest_Similarity, Age_combination, Sex_combination))
+```
+
+#### Analyse
+
+- Fittig model and getting the P-value
+```{r}
+Model_Female_Nestling <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID) + (1 | NestID:Nestling),
+                                 family = beta_family(link = "logit"),
+                                 data=MotherVSOtherF_Data)
+summary(Model_Female_Nestling) #AIC = -6970.3
+```
+P-value = 0.968, non-significant. Mother's preen oil composition is not more similar to that of their nestlings than that of another female in the population.
+```{r}
+#Conversion in linear unit
+mu_intercept <- 1.58318 
+mu_OtherF <- -0.01167
+plogis(mu_intercept + mu_OtherF) - plogis(mu_intercept)
+```
+The distance Mother-Nestling is 0.002 higher than the distance OtherFemale-Nestling in Bray-Curtis units.
+
+- Confidence intervals
+```{r}
+confint(Model_Female_Nestling)
+```
+$\beta$ estimate of the distance to adult females effect: -0.0016 (Beta family unit)
+Confidence interval: [-0.587 ; 0.564] --> includes "0".
+
+- AIC without Random effects
+```{r}
+Model_FN_noRandomeff <- glmmTMB(BC_Similarity ~ Relationship,
+                                family = beta_family(link = "logit"),
+                                data=MotherVSOtherF_Data)
+Model_FN_noNestlingID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID),
+                                 family = beta_family(link = "logit"),
+                                 data=MotherVSOtherF_Data)
+Model_FN_noNestID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID:Nestling),
+                             family = beta_family(link = "logit"),
+                             data=MotherVSOtherF_Data)
+anova(Model_Female_Nestling, Model_FN_noRandomeff, Model_FN_noNestlingID, Model_FN_noNestID)
+```
+The stronger AIC is for the full model.
+There is a significant difference between the model without random effects and the model without the NestID effect, but no with the model without NestlingID effect. The NestID effect seems to be the random effect with the most impact.
+
+### Father VS other adult males analysis
+```{r}
+FatherVSOtherM_Data <- Pairwise_Data%>%
+  mutate(Relationship = case_when(
+    Sex_combination == 'NM' & Nest_Similarity == '0' ~ 'OtherM',
+    Sex_combination == 'NM' & Nest_Similarity == '1' ~ 'Father'
+  ))%>%
+  filter(Relationship != "NA")
+Age_of_Samples <- Metadata_Families%>%
+  select(Sample, Ageclass)%>%
+  rename(SampleA = Sample)
+df_list <- list(FatherVSOtherM_Data, Age_of_Samples)
+FatherVSOtherM_Data <- df_list%>%
+  reduce(full_join, by="SampleA")%>%
+  filter(SampleB != "NA")%>%
+  mutate(SampleB = as.character(as.factor(SampleB)),
+    Nestling = ifelse(Ageclass == 'A', SampleB, SampleA))%>%
+  select(-c(Ageclass, Nest_Similarity, Age_combination, Sex_combination))
+```
+
+#### Analyse
+
+- Fittig model and getting the P-value
+```{r}
+Model_Male_Nestling <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID) + (1 | NestID:Nestling),
+                                 family = beta_family(link = "logit"),
+                                 data=FatherVSOtherM_Data)
+summary(Model_Male_Nestling) #AIC = -6970.3
+```
+P-value = 0.985, non-significant. Nestling's preen oil composition is not more similar to that of their father than to another male in the population.
+```{r}
+#Conversion in linear unit
+mu_intercept <- 1.74450 
+mu_OtherM <- -0.00599
+plogis(mu_intercept + mu_OtherM) - plogis(mu_intercept)
+```
+The distance Father-Nestling is 0.001 higher than the distance Other male - Nestling in Bray-Curtis units.
+
+- Confidence intervals
+```{r}
+confint(Model_Male_Nestling)
+```
+$\beta$ estimate of the distance to adult males effect: -0.0016 (Beta family unit)
+Confidence interval: [-0.627 ; 0.615] --> includes "0".
+
+- AIC without Random effects
+```{r}
+Model_MN_noRandomeff <- glmmTMB(BC_Similarity ~ Relationship,
+                                family = beta_family(link = "logit"),
+                                data=FatherVSOtherM_Data)
+Model_MN_noNestlingID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID),
+                                 family = beta_family(link = "logit"),
+                                 data=FatherVSOtherM_Data)
+Model_MN_noNestID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID:Nestling),
+                             family = beta_family(link = "logit"),
+                             data=FatherVSOtherM_Data)
+anova(Model_Male_Nestling, Model_MN_noRandomeff, Model_MN_noNestlingID, Model_MN_noNestID)
+```
+The stronger AIC is for the full model.
+There is a significant difference between the model without random effects and the model without the NestID effect, but no with the model without NestlingID effect. The NestID effect seems to be the random effect with the most impact.
+
+### Adult females VS adult males (other than mother and father) analysis
+```{r}
+OtherFVSOtherM_Data <- Pairwise_Data%>%
+  mutate(Relationship = case_when(
+    Sex_combination == 'NF' & Nest_Similarity == '0' ~ 'OtherF',
+    Sex_combination == 'NM' & Nest_Similarity == '0' ~ 'OtherM'
+  ))%>%
+  filter(Relationship != "NA")
+Age_of_Samples <- Metadata_Families%>%
+  select(Sample, Ageclass)%>%
+  rename(SampleA = Sample)
+df_list <- list(OtherFVSOtherM_Data, Age_of_Samples)
+OtherFVSOtherM_Data <- df_list%>%
+  reduce(full_join, by="SampleA")%>%
+  filter(SampleB != "NA")%>%
+  mutate(SampleB = as.character(as.factor(SampleB)),
+    Nestling = ifelse(Ageclass == 'A', SampleB, SampleA))%>%
+  select(-c(Ageclass, Nest_Similarity, Age_combination, Sex_combination))
+```
+
+#### Analyse
+
+- Fittig model and getting the P-value
+```{r}
+Model_Adult_Nestling <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID) + (1 | NestID:Nestling),
+                                 family = beta_family(link = "logit"),
+                                 data=OtherFVSOtherM_Data)
+summary(Model_Adult_Nestling) #AIC = -6970.3
+```
+P-value < 2e-16, significant. Nestlings' preen oil composition is not more similar to that of adult males than that of adult females in the population.
+```{r}
+#Conversion in linear unit
+mu_intercept <- 1.58315 
+mu_OtherM <- 0.14358
+plogis(mu_intercept + mu_OtherM) - plogis(mu_intercept)
+```
+The distance OtherM-Nestling is 0.02 higher than the distance OtherF-Nestling in Bray-Curtis units.
+
+- Confidence intervals
+```{r}
+confint(Model_Adult_Nestling)
+```
+$\beta$ estimate of the distance to adult males effect: 0.14 (Beta family unit)
+Confidence interval: [0.115 ; 0.173] --> does not include "0".
+
+- AIC without Random effects
+```{r}
+Model_RN_noRandomeff <- glmmTMB(BC_Similarity ~ Relationship,
+                                family = beta_family(link = "logit"),
+                                data=OtherFVSOtherM_Data)
+Model_RN_noNestlingID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID),
+                                 family = beta_family(link = "logit"),
+                                 data=OtherFVSOtherM_Data)
+Model_RN_noNestID <- glmmTMB(BC_Similarity ~ Relationship + (1 | NestID:Nestling),
+                             family = beta_family(link = "logit"),
+                             data=OtherFVSOtherM_Data)
+anova(Model_Adult_Nestling, Model_RN_noRandomeff, Model_RN_noNestlingID, Model_RN_noNestID)
+```
+The stronger AIC is for the model without NestID. This is the only model that is significantly different from the one with no random effect. NestID seem to be the only important random effect here. But note that the full model has almost the same AIC.
+
+### Plot
+```{r, fig.align='center'}
+# Prepare data for plotting
+Data_plot <- Pairwise_Data%>%
+  mutate(Relationship = case_when(
+    Sex_combination == 'NM' & Nest_Similarity == '1' ~ 'Father',
+    Sex_combination == 'NF' & Nest_Similarity == '1' ~ 'Mother',
+    Sex_combination == 'NF' & Nest_Similarity == '0' ~ 'Other adult female',
+    Sex_combination == 'NM' & Nest_Similarity == '0' ~ 'Other adult male',
+  ))%>%
+  filter(Relationship != "NA")
+Age_of_Samples <- Metadata_Families%>%
+  select(Sample, Ageclass)%>%
+  rename(SampleA = Sample)
+df_list <- list(Data_plot, Age_of_Samples)
+Data_plot <- df_list%>%
+  reduce(full_join, by="SampleA")%>%
+  filter(SampleB != "NA")%>%
+  mutate(SampleB = as.character(as.factor(SampleB)),
+         Nestling = ifelse(Ageclass == 'A', SampleB, SampleA))%>%
+  select(-c(Ageclass, Nest_Similarity, Age_combination, Sex_combination))
+
+# Plot
+ggplot(Data_plot, aes(x = Relationship, y = BC_Similarity)) +
+  geom_boxplot(data = Data_plot %>% filter(Relationship == "Other adult female"), outlier.shape = NA, width = 0.25, lwd = 0.5, alpha = 0.8, colour = "black", fill = "#BCBAB7") + 
+  geom_boxplot(data = Data_plot %>% filter(Relationship == "Mother"), position = position_nudge(x = -0.3), outlier.shape = NA, width = 0.25, lwd = 0.5, alpha = 0.8, colour = "black", fill = "#BCBAB7") + 
+  geom_boxplot(data = Data_plot %>% filter(Relationship == "Father"), position = position_nudge(x = 0.3), outlier.shape = NA, width = 0.25, lwd = 0.5, alpha = 0.8, colour = "black", fill = "#323235") +
+  geom_boxplot(data = Data_plot %>% filter(Relationship == "Other adult male"), outlier.shape = NA, width = 0.25, lwd = 0.5, alpha = 0.8, colour = "black", fill = "#323235") +
+  geom_line(data = Data_plot %>% filter(Relationship == "Father" | Relationship == "Mother"), aes(group = Nestling), alpha = 0.1, size = 0.6, position = position_dodge(0), show.legend = FALSE) +
+  geom_point(data = Data_plot %>% filter(Relationship == "Mother" | Relationship == "Father"), aes(color = Relationship), alpha = 0.8, size=2) +
+  scale_color_manual(values = c("#323235","#BCBAB7")) +
+  ylab("Bray-Curtis similarity") +
+  theme(legend.position = "none",
+        axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=10),
+        axis.title.x = element_blank()) +
+  scale_x_discrete(limits = c("Other adult female", "Mother", "Father", "Other adult male"))
+```
+
+
+# Control analysis including the four clear outliers
+
+The sample sizes for the analysis of the effect of breeding stage and individual ID in females is slightly lower than in the pre-registration  (repeated samples for 29 females instead of 33). Indeed, we discarded four samples from incubating females for which the alignment did not accurately reflect the chromatogram.
+But to make sure that these samples would not affect our conclusions, we re-made the breeding-stage and individual identity analysis in females including these outliers.
+
+Data = 33 individual females (66 samples) sampled both during the incubation and nestling-rearing period
+
+```{r}
+# Subset of the Metadata for the breeding stage and individual identity analyses:
+F_sampled_twice_out <- Metadata%>%   # 58 samples
+  filter(f_sampled_twice==1)%>%
+  mutate(Breeding_Stage = as.factor(as.character(Breeding_Stage)))%>%
+  select(-c(pair_brood, Partner_Connected_to_Outlier, Outliers, F_Connected_to_Outlier, Families, FamiliesOrdered, clutchsize, broodsize))
+```
+
+### NMDS plot
+
+Step 1: Building a Bray-Curtis matrix
+```{r, message=FALSE, results='hide'}
+ChemdataBS <- Chemdata%>%
+  filter(Sample %in% F_sampled_twice_out$Sample)%>%
+  select(-Sample)
+bc <- metaMDS(ChemdataBS, distance = "bray")
+```
+Step 2: Checking the stress 
+```{r}
+bc$stress
+```
+Step 3: Plot the NMDS, here by breeding stage
+```{r, echo=FALSE, fig.align='center'}
+# NMDS breeding stage
+bc <- as.data.frame(bc[["points"]])
+F_sampled_twice_out$MDS1 <- bc$MDS1
+F_sampled_twice_out$MDS2 <- bc$MDS2
+# plot
+ggplot(F_sampled_twice_out) +
+  geom_point(aes(x=MDS1, y=MDS2, color = Breeding_Stage, size = Breeding_Stage, shape = Breeding_Stage)) +
+  stat_ellipse(aes(MDS1, MDS2, color = Breeding_Stage), type = "t", level = 0.95) +
+  scale_size_manual(values=c(5,5)) +
+  scale_shape_manual(values=c(16,16)) +
+  scale_color_manual(values = c("#66cdff","#97704d")) +
+  theme_void() + 
+  theme(panel.background = element_rect(colour = "grey3", size = 0.3, fill = NA),
+        aspect.ratio = 1,
+        legend.title = element_blank(),
+        legend.position = c(0.158, .9),
+        legend.text = element_text(size=8),
+        legend.background = element_rect(size = 0.4, linetype = "solid", color = "grey"),
+        legend.key.size = unit(0.3, "cm"),
+        legend.margin = margin(0,3,2,2),
+        plot.margin=unit(c(1,1,1,1),"cm"))
+```
+
+### Richness
+
+a. Visualisation of the breeding stage difference (within individuals) in terms of chemical richness.
+```{r, message=FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(F_sampled_twice_out, aes(x=Breeding_Stage, y=Richness))+
+  geom_boxplot(data = F_sampled_twice_out %>% filter(Breeding_Stage=="Incubation"),
+               aes(x=Breeding_Stage, y=Richness),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = 0.25,lwd = 0.5,
+               alpha = 0.8, colour="black", fill = "#66cdff")+ 
+  geom_boxplot(data = F_sampled_twice_out %>% filter(Breeding_Stage=="N_Rearing"), lwd = 0.5,
+               aes(x=Breeding_Stage, y=Richness),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = 0.25,
+               alpha = 0.8, colour="black", fill = "#97704d")+
+  geom_line(aes(group=Individual_ID),alpha = 0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(aes(color = Breeding_Stage), alpha = 0.8, size=2.5,show.legend = FALSE)+
+  scale_color_manual(values = c("#66cdff", "#97704d")) +
+  scale_x_discrete(labels=c("Incubation","Nestling-rearing")) +
+  ylab("Number of substances") +
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r}
+LMM_B_Stage_R <- lme4::lmer(formula = "Richness ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice_out)
+summary(LMM_B_Stage_R)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Richness ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice_out))
+```
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_B_Stage_R, conf.int = TRUE, conf.method = 'boot') 
+```
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_B_Stage_R, nboot = 1000) 
+```
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Richness ~ Breeding_Stage + (1 | Individual_ID),
+    grname = "Individual_ID",
+    data = F_sampled_twice_out, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE)
+```
+
+- Model diagnostic
+```{r}
+check_model(LMM_B_Stage_R)
+```
+
+### Diversity
+
+a. Visualisation of the breeding stage difference (within individuals) in terms of Shannon diversity.
+```{r, echo=FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(F_sampled_twice_out, aes(x=Breeding_Stage, y=Shannon_Index))+
+  geom_boxplot(data = F_sampled_twice_out %>% filter(Breeding_Stage=="Incubation"),
+               aes(x=Breeding_Stage, y=Shannon_Index),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = 0.25,lwd = 0.5,
+               alpha = 0.8, colour="black", fill = "#66cdff")+ 
+  geom_boxplot(data = F_sampled_twice_out %>% filter(Breeding_Stage=="N_Rearing"), lwd = 0.5,
+               aes(x=Breeding_Stage, y=Shannon_Index),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = 0.25,
+               alpha = 0.8, colour="black", fill = "#97704d")+
+  geom_line(aes(group=Individual_ID),alpha = 0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(aes(color = Breeding_Stage), alpha = 0.8, size=2.5,show.legend = FALSE)+
+  scale_color_manual(values = c("#66cdff", "#97704d")) +
+  scale_x_discrete(labels=c("Incubation","Nestling-rearing")) +
+  ylab("Shannon index") +
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r, warning=FALSE}
+LMM_B_Stage_D <- lme4::lmer(formula = "Shannon_Index ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice_out)
+summary(LMM_B_Stage_D)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Shannon_Index ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice_out))
+```
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_B_Stage_D, conf.int = TRUE, conf.method = 'boot') 
+```
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_B_Stage_D, nboot = 1000) 
+```
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Shannon_Index ~ Breeding_Stage + (1 | Individual_ID),
+    grname = "Individual_ID",
+    data = F_sampled_twice_out, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+
+- Model diagnostic
+```{r}
+check_model(LMM_B_Stage_D)
+```
+
+### Volatility
+
+a. Visualisation of the breeding stage difference (within individuals) in terms of volatility.
+```{r, echo = FALSE, fig.align='center'}
+theme_set(theme_classic())
+ggplot(F_sampled_twice_out, aes(x=Breeding_Stage, y=Volatility))+
+  geom_boxplot(data = F_sampled_twice_out %>% filter(Breeding_Stage=="Incubation"),
+               aes(x=Breeding_Stage, y=Volatility),
+               position=position_nudge(x=-0.3), outlier.shape = NA, width = 0.25,lwd = 0.5,
+               alpha = 0.8, colour="black", fill = "#66cdff")+ 
+  geom_boxplot(data = F_sampled_twice_out %>% filter(Breeding_Stage=="N_Rearing"), lwd = 0.5,
+               aes(x=Breeding_Stage, y=Volatility),
+               position=position_nudge(x=0.3), outlier.shape = NA, width = 0.25,
+               alpha = 0.8, colour="black", fill = "#97704d")+
+  geom_line(aes(group=Individual_ID),alpha = 0.1, size = 0.6, position=position_dodge(0), show.legend = FALSE)+
+  geom_point(aes(color = Breeding_Stage), alpha = 0.8, size=2.5,show.legend = FALSE)+
+  scale_color_manual(values = c("#66cdff", "#97704d")) +
+  scale_x_discrete(labels=c("Incubation","Nestling-rearing")) +
+  ylab("Proportion of high-volatility substances") +
+  theme(axis.title.y=element_text(size=16, margin = margin(t = 0, r = 10, b = 0, l = 0)),
+        axis.text.y = element_text(size=13),
+        axis.text.x = element_text(size=14),
+        axis.title.x = element_blank())
+```
+
+b. Analysis 
+
+- Fitting the model
+```{r}
+LMM_B_Stage_V <- lme4::lmer(formula = "Volatility ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice_out)
+summary(LMM_B_Stage_V)
+```
+ 
+- Finding the P-value for the fixed effect
+```{r}
+summary(lmerTest::lmer(formula = "Volatility ~ Breeding_Stage + (1 | Individual_ID)",  data = F_sampled_twice_out))
+```
+
+- Finding the $\beta$ estimate and it's confidence interval (fixed effect)
+```{r, message=FALSE}
+tidy(LMM_B_Stage_V, conf.int = TRUE, conf.method = 'boot') 
+```
+
+- Finding the marginal R$^2$ (fixed effect)
+```{r}
+partR2(LMM_B_Stage_V, nboot = 1000) 
+```
+
+- Finding the repeatability (random effect)
+```{r, message=FALSE}
+rpt(Volatility ~ Breeding_Stage + (1 | Individual_ID),
+    grname = "Individual_ID",
+    data = F_sampled_twice_out, datatype = "Gaussian",
+    nboot = 1000, npermut = 1000,
+    adjusted = TRUE) 
+```
+
+- Model diagnostic
+```{r}
+check_model(LMM_B_Stage_V)
+```
+
+
+
+
